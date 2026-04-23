@@ -10,6 +10,19 @@ that folder.
 
 ![icon](assets/icon.png)
 
+## Usage
+
+1. In a note, lasso a word.
+2. Tap the 3-dots menu on the lasso toolbar → **Folder Shortcuts**.
+3. Navigate to the target folder in the picker, then tap
+   **Link lasso → this folder**.
+4. The word is underlined. Tap the underlined word with the pen or
+   with your finger to open the folder.
+
+To remove a link, lasso the word again and use the native 3-dots
+menu → **Remove Link** (the plugin's size gate lets the lasso pass
+through without opening the folder).
+
 ## How it works
 
 The Supernote plugin SDK can set a native link on lassoed strokes
@@ -111,19 +124,5 @@ push`) and install it from the plugin manager on the device.
 adb push build/outputs/SupernoteFolderShortcuts.snplg /sdcard/MyStyle/
 ```
 
-## Usage
 
-1. In a note, lasso a word.
-2. Tap the 3-dots menu on the lasso toolbar → **Folder Shortcuts**.
-3. Navigate to the target folder in the picker, then tap
-   **Link lasso → this folder**.
-4. The word is underlined. Tap the underlined word with the pen or
-   with your finger to open the folder.
 
-To remove a link, lasso the word again and use the native 3-dots
-menu → **Remove Link** (the plugin's size gate lets the lasso pass
-through without opening the folder).
-
-## License
-
-TBD.

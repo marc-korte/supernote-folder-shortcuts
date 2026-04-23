@@ -149,4 +149,11 @@ export const findShortcut = (
       y <= s.bottom + pad,
   );
 
-export const getCache = (): Shortcut[] => cache;
+export const shortcutsForPage = (notePath: string, page: number): Shortcut[] =>
+  cache.filter(s => s.notePath === notePath && s.page === page);
+
+export const shortcutId = (s: Shortcut): string =>
+  `${s.notePath}#${s.page}#${s.left},${s.top},${s.right},${s.bottom}`;
+
+export const findById = (id: string): Shortcut | undefined =>
+  cache.find(s => shortcutId(s) === id);

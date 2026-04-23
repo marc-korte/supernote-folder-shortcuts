@@ -25,28 +25,62 @@ This plugin works around that by:
    an empty directory whose hex-encoded name carries all the fields —
    the SDK exposes `makeDir` / `listFiles` / `deleteDir` but no generic
    file-write primitive.
-3. Listening for `PEN_UP` events globally. When the user taps inside a
-   saved rect on the current page, the plugin deletes the tap's ink
-   stroke and calls `FileUtils.openFilePath(folderPath)`, which opens
-   the Supernote file manager in that folder.
+3. **Pen path:** listening for `PEN_UP` events globally. When a tap-sized
+   stroke (≤10 sample points) lands inside a saved rect on the current
+   page, the plugin deletes the tap's ink stroke and calls
+   `FileUtils.openFilePath(folderPath)`.
+4. **Finger path:** a native Android module installs a transparent
+   `SYSTEM_ALERT_WINDOW` overlay over each linked word's on-screen
+   rectangle. The overlay consumes finger (`TOOL_TYPE_FINGER`) taps and
+   passes stylus events straight through, so writing/lassoing over the
+   linked region still works. Overlays are refreshed on a 1.5 s context
+   poll so navigating between pages/notes re-installs the right set.
 
-A size gate ensures only small (tap-like) strokes activate the
-shortcut; lassoes and writing pass through untouched, so you can still
-use the native 3-dots menu on a linked word to edit or remove the
-link.
+A stroke-point discriminator lets lassoes pass through the pen path
+untouched, so you can still use the native 3-dots menu on a linked
+word to edit or remove the link.
 
 ## Limitations
 
-- **Pen-only activation.** The Supernote routes finger touches to a
-  separate input subsystem (`pt_mt`); the plugin SDK only exposes
-  Wacom-pen events (`event_pen_up`). Finger taps on the note canvas are
-  not delivered to plugins.
 - **Native link handler ignores folder paths.** Without this plugin
   running, tapping a linked word is a no-op. The plugin must be
   installed and enabled.
-- The shortcut's rect is anchored to the original lasso rectangle. If
-  a user erases or drastically rearranges the underlying strokes, the
-  sidecar entry will be stale.
+- **Finger path depends on `SYSTEM_ALERT_WINDOW` being granted to the
+  plugin host** (`com.ratta.supernote.pluginhost`). On the tested
+  firmware it is granted at install time; other firmware revisions may
+  behave differently.
+- **Finger tap delay of up to 1.5 s when switching pages/notes.** The
+  Finger path uses a 1.5 s context poll to re-install
+  `SYSTEM_ALERT_WINDOW` overlays after navigation, so a freshly
+  entered page can ignore finger taps for up to one poll interval.
+  Mitigation: replace the polling loop with an event-driven refresh
+  (e.g., subscribe to page/note change events from the SDK) so
+  overlays re-install immediately on navigation.
+- **False activation risk on small deliberate strokes.** The pen path
+  treats any stroke of ≤10 sample points as a tap (see
+  `TAP_MAX_POINTS`), so a very short intentional mark that lands
+  inside a saved rect can be consumed and trigger the shortcut.
+- **Tool type detection assumes reliable `TOOL_TYPE_FINGER` vs. stylus
+  classification.** The `SYSTEM_ALERT_WINDOW` overlay only swallows
+  events where `getToolType(0) == TOOL_TYPE_FINGER` and passes
+  everything else through. Devices or firmware that misreport tool
+  type (e.g., stylus events arriving as finger, or vice-versa) will
+  either break writing over a linked word or stop finger taps from
+  opening the folder.
+- The shortcut's rect is anchored to the original lasso rectangle in
+  page coords. If a user erases or drastically rearranges the
+  underlying strokes, the sidecar entry will be stale.
+- **Important — page coords are assumed 1:1 with screen pixels.**
+  Verified only on a Supernote reporting
+  `ro.product.model=Supernote Nomad`. This assumption is fragile
+  across devices: other Supernote models (A5X, A6X, Manta, future
+  revisions) may use different panel resolutions, DPIs, or zoom
+  levels, and the overlay rectangles will land in the wrong place on
+  screen. Action items for integrators: test on every target
+  Supernote model before relying on the plugin, and implement a
+  dynamic scale factor — derive it from device DPI / current zoom and
+  convert page coords to screen coords with that factor instead of
+  using the raw values.
 
 ## Build
 

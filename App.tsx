@@ -1,18 +1,18 @@
 /**
- * Folder Shortcuts — lasso-toolbar plugin
+ * Folder Shortcuts — plugin view.
  *
- * Flow:
- *   user lassos a word in a note → taps 3-dots → picks Folder Shortcuts
- *   → this view opens → user navigates to target folder → taps
- *   "Link lasso → this folder" → we save a sidecar entry
- *   (notePath, page, lassoRect, folderPath) and call setLassoStrokeLink
- *   so the word gets the native underline. Tapping the underlined word
- *   fires PEN_UP, which our listener in index.js catches and turns into
- *   FileUtils.openFilePath(folderPath).
+ * Opened from the lasso toolbar (type=2) after the user has lassoed a
+ * word. Lets the user navigate to a target folder and tap
+ * "Link lasso → this folder", which:
+ *   1. calls setLassoStrokeLink(linkType=2) for the native underline,
+ *   2. saves a sidecar entry (notePath, page, rect, folderPath),
+ *   3. signals index.js to refresh the on-canvas overlay for the new
+ *      shortcut so finger tap works immediately.
  */
 
 import React, {useEffect, useMemo, useState} from 'react';
 import {
+  DeviceEventEmitter,
   FlatList,
   Pressable,
   StyleSheet,
@@ -111,8 +111,6 @@ function App(): React.JSX.Element {
       const page = unwrap<number>(pageRes);
       const notePath = unwrap<string>(pathRes);
 
-      console.log('[folder-link] link-press context', {rect, page, notePath, cwd});
-
       if (
         !rect ||
         typeof rect.left !== 'number' ||
@@ -134,7 +132,6 @@ function App(): React.JSX.Element {
         style: 0,
         linkType: 2,
       });
-      console.log('[folder-link] setLassoStrokeLink result', linkResult);
       if (linkResult && linkResult.success === false) {
         setStatus(
           `Link FAIL code=${linkResult?.error?.code} msg=${linkResult?.error?.message}`,
@@ -152,11 +149,12 @@ function App(): React.JSX.Element {
         folderPath: cwd,
       });
 
+      DeviceEventEmitter.emit('folderLinkShortcutsChanged');
+
       setStatus(`OK — linked to ${cwd}. Closing…`);
       setTimeout(() => PluginManager.closePluginView(), 600);
     } catch (e: any) {
-      console.log('[folder-link] link-press error', e);
-      setStatus(`THREW: ${e?.message ?? String(e)}`);
+      setStatus(`Error: ${e?.message ?? String(e)}`);
     }
   };
 
@@ -224,16 +222,16 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 12,
     right: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
   },
   closeText: {
-    fontSize: 32,
+    fontSize: 44,
     fontWeight: '600',
     color: '#000000',
   },
   title: {
-    fontSize: 32,
+    fontSize: 40,
     fontWeight: '700',
     color: '#000000',
     marginBottom: 14,
@@ -244,8 +242,8 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   upBtn: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    paddingHorizontal: 20,
+    paddingVertical: 14,
     borderWidth: 1,
     borderColor: '#000000',
     borderRadius: 6,
@@ -255,62 +253,65 @@ const styles = StyleSheet.create({
     borderColor: '#cccccc',
   },
   upBtnText: {
-    fontSize: 20,
+    fontSize: 26,
     color: '#000000',
   },
   breadcrumb: {
-    fontSize: 20,
-    color: '#333333',
+    fontSize: 28,
+    color: '#000000',
+    fontWeight: '500',
     flex: 1,
     fontFamily: 'monospace',
   },
   linkBtn: {
     backgroundColor: '#000000',
     borderRadius: 8,
-    paddingVertical: 18,
+    paddingVertical: 24,
     paddingHorizontal: 18,
     marginBottom: 12,
   },
   linkBtnText: {
     color: '#ffffff',
-    fontSize: 22,
+    fontSize: 30,
     fontWeight: '600',
   },
   linkBtnPath: {
     color: '#cccccc',
-    fontSize: 16,
+    fontSize: 20,
     fontFamily: 'monospace',
     marginTop: 4,
   },
   status: {
-    fontSize: 18,
+    fontSize: 24,
     color: '#000000',
     backgroundColor: '#f0f0f0',
-    padding: 14,
+    padding: 18,
     borderRadius: 6,
     marginBottom: 12,
   },
   error: {
-    fontSize: 18,
+    fontSize: 24,
     color: '#aa0000',
     padding: 12,
   },
   row: {
-    paddingVertical: 18,
+    paddingVertical: 28,
     paddingHorizontal: 16,
     borderBottomWidth: 1,
-    borderBottomColor: '#e0e0e0',
+    borderBottomColor: '#b0b0b0',
   },
   rowFile: {
-    opacity: 0.5,
+    opacity: 0.4,
   },
   rowText: {
-    fontSize: 24,
+    fontSize: 40,
+    fontWeight: '600',
     color: '#000000',
   },
   empty: {
-    fontSize: 20,
-    color: '#777777',
+    fontSize: 30,
+    color: '#555555',
+    fontWeight: '500',
     padding: 14,
   },
 });

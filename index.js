@@ -144,7 +144,7 @@ const isTapStroke = async (el) => {
 };
 
 // The SDK delivers each PEN_UP up to 4 times within ~10ms. Dedupe by uuid,
-// synchronously, before any await — otherwise concurrent handlers race.
+// synchronously, before any await, otherwise concurrent handlers race.
 const handledUuids = new Set();
 const rememberHandled = (uuid) => {
   if (!uuid) return;

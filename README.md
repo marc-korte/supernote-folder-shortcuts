@@ -4,8 +4,8 @@ A plugin for the Supernote A5X/A6X/Nomad/Manta that lets you turn any
 handwritten or typed word into a one-tap shortcut to a folder.
 
 Lasso a word, pick a folder from the plugin's file browser, and a native
-link is attached to the word. Tapping the underlined word — with the pen
-or with a finger — navigates the Supernote file manager straight into
+link is attached to the word. Tapping the underlined word, with the pen
+or with a finger, navigates the Supernote file manager straight into
 that folder.
 
 ![icon](assets/icon.png)
@@ -27,8 +27,8 @@ through without opening the folder).
 
 The Supernote plugin SDK can set a native link on lassoed strokes
 (`setLassoStrokeLink`) but only supports linkTypes 0..4 (page / note
-file / document / image / URL) — **there is no "folder" linkType**, so
-tapping the native link does nothing on its own.
+file / document / image / URL), and **there is no "folder" linkType**,
+so tapping the native link does nothing on its own.
 
 This plugin works around that by:
 
@@ -36,9 +36,9 @@ This plugin works around that by:
    underline.
 2. Persisting a sidecar record of `{notePath, page, rect, folderPath}`
    inside the plugin's own data directory. Each shortcut is stored as
-   an empty directory whose hex-encoded name carries all the fields —
-   the SDK exposes `makeDir` / `listFiles` / `deleteDir` but no generic
-   file-write primitive.
+   an empty directory whose hex-encoded name carries all the fields,
+   since the SDK exposes `makeDir` / `listFiles` / `deleteDir` but no
+   generic file-write primitive.
 3. **Pen path:** listening for `PEN_UP` events globally. When a tap-sized
    stroke (≤10 sample points) lands inside a saved rect on the current
    page, the plugin deletes the tap's ink stroke and calls
@@ -84,15 +84,14 @@ word to edit or remove the link.
 - The shortcut's rect is anchored to the original lasso rectangle in
   page coords. If a user erases or drastically rearranges the
   underlying strokes, the sidecar entry will be stale.
-- **Important — page coords are assumed 1:1 with screen pixels.**
-  Verified only on a Supernote reporting
-  `ro.product.model=Supernote Nomad`. This assumption is fragile
-  across devices: other Supernote models (A5X, A6X, Manta, future
+- **Important: page coords are assumed 1:1 with screen pixels.**
+  Verified only on a Supernote Manta. This assumption is fragile
+  across devices: other Supernote models (A5X, A6X, Nomad, future
   revisions) may use different panel resolutions, DPIs, or zoom
   levels, and the overlay rectangles will land in the wrong place on
   screen. Action items for integrators: test on every target
   Supernote model before relying on the plugin, and implement a
-  dynamic scale factor — derive it from device DPI / current zoom and
+  dynamic scale factor: derive it from device DPI / current zoom and
   convert page coords to screen coords with that factor instead of
   using the raw values.
 

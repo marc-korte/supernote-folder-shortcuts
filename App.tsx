@@ -1,5 +1,5 @@
 /**
- * Folder Shortcuts — plugin view.
+ * Folder Shortcuts plugin view.
  *
  * Opened from the lasso toolbar (type=2) after the user has lassoed a
  * word. Lets the user navigate to a target folder and tap
@@ -151,7 +151,7 @@ function App(): React.JSX.Element {
 
       DeviceEventEmitter.emit('folderLinkShortcutsChanged');
 
-      setStatus(`OK — linked to ${cwd}. Closing…`);
+      setStatus(`OK: linked to ${cwd}. Closing…`);
       setTimeout(() => PluginManager.closePluginView(), 600);
     } catch (e: any) {
       setStatus(`Error: ${e?.message ?? String(e)}`);

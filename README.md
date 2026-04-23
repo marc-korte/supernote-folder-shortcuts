@@ -4,8 +4,9 @@ A plugin for the Supernote A5X/A6X/Nomad/Manta that lets you turn any
 handwritten or typed word into a one-tap shortcut to a folder.
 
 Lasso a word, pick a folder from the plugin's file browser, and a native
-link is attached to the word. Tapping the underlined word with the pen
-navigates the Supernote file manager straight into that folder.
+link is attached to the word. Tapping the underlined word — with the pen
+or with a finger — navigates the Supernote file manager straight into
+that folder.
 
 ![icon](assets/icon.png)
 
@@ -116,8 +117,8 @@ adb push build/outputs/SupernoteFolderShortcuts.snplg /sdcard/MyStyle/
 2. Tap the 3-dots menu on the lasso toolbar → **Folder Shortcuts**.
 3. Navigate to the target folder in the picker, then tap
    **Link lasso → this folder**.
-4. The word is underlined. Tap the underlined word with the pen to
-   open the folder.
+4. The word is underlined. Tap the underlined word with the pen or
+   with your finger to open the folder.
 
 To remove a link, lasso the word again and use the native 3-dots
 menu → **Remove Link** (the plugin's size gate lets the lasso pass

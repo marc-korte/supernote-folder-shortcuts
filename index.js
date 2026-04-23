@@ -38,6 +38,38 @@ const unwrap = (res) => (res && typeof res === 'object' && 'result' in res ? res
 const Overlay = NativeModules.FolderLinkOverlay;
 let lastContextKey = '';
 
+// Lasso rects come back in page coords. On a Manta/Nomad those happen to match
+// screen pixels 1:1, but on other Supernote panels the ratio differs. Compute
+// the ratio from display metrics and the SDK's page size so overlay rectangles
+// land on the right spot regardless of device. Zoom is not handled yet.
+const scaleProbe = async (notePath, page) => {
+  try {
+    const [metrics, pageSizeRes] = await Promise.all([
+      Overlay.getDisplayMetrics(),
+      PluginFileAPI.getPageSize(notePath, page),
+    ]);
+    const pageSize = unwrap(pageSizeRes);
+    if (
+      metrics &&
+      typeof metrics.widthPixels === 'number' &&
+      typeof metrics.heightPixels === 'number' &&
+      pageSize &&
+      typeof pageSize.width === 'number' &&
+      typeof pageSize.height === 'number' &&
+      pageSize.width > 0 &&
+      pageSize.height > 0
+    ) {
+      return {
+        x: metrics.widthPixels / pageSize.width,
+        y: metrics.heightPixels / pageSize.height,
+      };
+    }
+  } catch (e) {
+    console.log('[folder-link] scaleProbe failed, assuming 1:1:', e?.message ?? String(e));
+  }
+  return {x: 1, y: 1};
+};
+
 const refreshOverlays = async () => {
   if (!Overlay || typeof Overlay.setOverlays !== 'function') return;
   try {
@@ -55,12 +87,13 @@ const refreshOverlays = async () => {
       await Overlay.setOverlays([]);
       return;
     }
+    const scale = await scaleProbe(notePath, page);
     const overlays = shortcutsForPage(notePath, page).map((s) => ({
       id: shortcutId(s),
-      x: Math.round(s.left),
-      y: Math.round(s.top),
-      width: Math.round(s.right - s.left),
-      height: Math.round(s.bottom - s.top),
+      x: Math.round(s.left * scale.x),
+      y: Math.round(s.top * scale.y),
+      width: Math.round((s.right - s.left) * scale.x),
+      height: Math.round((s.bottom - s.top) * scale.y),
     }));
     await Overlay.setOverlays(overlays);
   } catch (e) {

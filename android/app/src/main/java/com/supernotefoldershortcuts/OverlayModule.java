@@ -8,6 +8,7 @@ import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -137,6 +138,25 @@ public class OverlayModule extends ReactContextBaseJavaModule {
                 promise.reject("OPEN_FOLDER_FAILED", e);
             }
         });
+    }
+
+    @ReactMethod
+    public void getDisplayMetrics(Promise promise) {
+        try {
+            Context ctx = getReactApplicationContext();
+            WindowManager localWm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+            DisplayMetrics m = new DisplayMetrics();
+            localWm.getDefaultDisplay().getRealMetrics(m);
+            WritableMap map = Arguments.createMap();
+            map.putInt("widthPixels", m.widthPixels);
+            map.putInt("heightPixels", m.heightPixels);
+            map.putDouble("density", m.density);
+            map.putInt("densityDpi", m.densityDpi);
+            promise.resolve(map);
+        } catch (Exception e) {
+            Log.e(TAG, "getDisplayMetrics failed: " + e.getMessage(), e);
+            promise.reject("METRICS_FAILED", e);
+        }
     }
 
     @ReactMethod

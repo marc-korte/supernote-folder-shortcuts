@@ -22,7 +22,8 @@ import {
 import {FileUtils, PluginCommAPI, PluginManager, PluginNoteAPI} from 'sn-plugin-lib';
 import {addShortcut} from './shortcuts';
 
-const NOTE_ROOT = '/storage/emulated/0/Note';
+const SUPERNOTE_ROOT = '/storage/emulated/0';
+const NOTE_DIR = SUPERNOTE_ROOT + '/Note';
 
 type Entry = {name: string; path: string; isFolder: boolean};
 
@@ -60,10 +61,11 @@ function unwrap<T>(res: any): T | null {
 }
 
 function App(): React.JSX.Element {
-  const [cwd, setCwd] = useState<string>(NOTE_ROOT);
+  const [cwd, setCwd] = useState<string>(NOTE_DIR);
   const [entries, setEntries] = useState<Entry[]>([]);
   const [listError, setListError] = useState<string | null>(null);
   const [status, setStatus] = useState<string>('Navigate to a folder, then tap the button.');
+  const [showHidden, setShowHidden] = useState<boolean>(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -88,15 +90,20 @@ function App(): React.JSX.Element {
   }, [cwd]);
 
   const breadcrumb = useMemo(() => {
-    if (cwd === NOTE_ROOT) return 'Note/';
-    const rel = cwd.startsWith(NOTE_ROOT + '/') ? cwd.slice(NOTE_ROOT.length + 1) : cwd;
-    return 'Note/' + rel;
+    if (cwd === SUPERNOTE_ROOT) return 'Supernote/';
+    const rel = cwd.startsWith(SUPERNOTE_ROOT + '/') ? cwd.slice(SUPERNOTE_ROOT.length + 1) : cwd;
+    return 'Supernote/' + rel;
   }, [cwd]);
 
+  const visibleEntries = useMemo(
+    () => (showHidden ? entries : entries.filter(e => !e.name.startsWith('.'))),
+    [entries, showHidden],
+  );
+
   const goUp = () => {
-    if (cwd === NOTE_ROOT) return;
+    if (cwd === SUPERNOTE_ROOT) return;
     const parent = cwd.replace(/\/+$/, '').replace(/\/[^/]+$/, '');
-    setCwd(parent || NOTE_ROOT);
+    setCwd(parent || SUPERNOTE_ROOT);
   };
 
   const linkLassoToCwd = async () => {
@@ -168,14 +175,21 @@ function App(): React.JSX.Element {
 
       <View style={styles.pathBar}>
         <Pressable
-          style={[styles.upBtn, cwd === NOTE_ROOT && styles.upBtnDisabled]}
+          style={[styles.upBtn, cwd === SUPERNOTE_ROOT && styles.upBtnDisabled]}
           onPress={goUp}
-          disabled={cwd === NOTE_ROOT}>
+          disabled={cwd === SUPERNOTE_ROOT}>
           <Text style={styles.upBtnText}>↑ up</Text>
         </Pressable>
         <Text style={styles.breadcrumb} numberOfLines={1}>
           {breadcrumb}
         </Text>
+        <Pressable
+          style={styles.hiddenToggle}
+          onPress={() => setShowHidden(v => !v)}>
+          <Text style={styles.hiddenToggleText}>
+            {showHidden ? '[✓]' : '[ ]'} Hidden
+          </Text>
+        </Pressable>
       </View>
 
       <Pressable style={styles.linkBtn} onPress={linkLassoToCwd}>
@@ -191,7 +205,7 @@ function App(): React.JSX.Element {
         <Text style={styles.error}>{listError}</Text>
       ) : (
         <FlatList
-          data={entries}
+          data={visibleEntries}
           keyExtractor={item => item.path}
           ListEmptyComponent={<Text style={styles.empty}>Empty folder.</Text>}
           renderItem={({item}) => (
@@ -255,6 +269,19 @@ const styles = StyleSheet.create({
   upBtnText: {
     fontSize: 26,
     color: '#000000',
+  },
+  hiddenToggle: {
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderWidth: 1,
+    borderColor: '#000000',
+    borderRadius: 6,
+    marginLeft: 12,
+  },
+  hiddenToggleText: {
+    fontSize: 22,
+    color: '#000000',
+    fontFamily: 'monospace',
   },
   breadcrumb: {
     fontSize: 28,

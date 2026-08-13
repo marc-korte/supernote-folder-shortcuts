@@ -18,7 +18,7 @@ class MainApplication : Application(), ReactApplication {
       object : DefaultReactNativeHost(this) {
         override fun getPackages(): List<ReactPackage> =
             PackageList(this).packages.apply {
-              add(OverlayPackage())
+              add(FolderLinkPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"

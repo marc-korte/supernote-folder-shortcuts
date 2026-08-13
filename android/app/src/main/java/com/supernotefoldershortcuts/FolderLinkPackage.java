@@ -8,10 +8,10 @@ import com.facebook.react.uimanager.ViewManager;
 import java.util.Collections;
 import java.util.List;
 
-public class OverlayPackage implements ReactPackage {
+public class FolderLinkPackage implements ReactPackage {
     @Override
     public List<NativeModule> createNativeModules(ReactApplicationContext reactContext) {
-        return Collections.singletonList(new OverlayModule(reactContext));
+        return Collections.singletonList(new FolderLinkModule(reactContext));
     }
 
     @Override

@@ -4,10 +4,11 @@
  * Opened from the lasso toolbar (type=2) after the user has lassoed a
  * word. Lets the user navigate to a target folder and tap
  * "Link lasso → this folder", which:
- *   1. calls setLassoStrokeLink(linkType=2) for the native underline,
- *   2. saves a sidecar entry (notePath, page, rect, folderPath),
- *   3. signals index.js to refresh the on-canvas overlay for the new
- *      shortcut so finger tap works immediately.
+ *   1. calls setLassoStrokeLink(linkType=2), which both draws the native
+ *      underline and stores the link in the note — the note is the only
+ *      record we keep, so removing the link in the note removes the shortcut,
+ *   2. signals index.js to refresh the on-canvas overlay for the new link so
+ *      finger tap works immediately.
  */
 
 import React, {useEffect, useMemo, useState} from 'react';
@@ -20,7 +21,7 @@ import {
   View,
 } from 'react-native';
 import {FileUtils, PluginCommAPI, PluginManager, PluginNoteAPI} from 'sn-plugin-lib';
-import {addShortcut} from './shortcuts';
+import {addPendingLink} from './links';
 
 const SUPERNOTE_ROOT = '/storage/emulated/0';
 const NOTE_DIR = SUPERNOTE_ROOT + '/Note';
@@ -49,14 +50,14 @@ function normalizeEntries(raw: RawListItem[]): Entry[] {
     }
   }
   out.sort((a, b) => {
-    if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
+    if (a.isFolder !== b.isFolder) {return a.isFolder ? -1 : 1;}
     return a.name.localeCompare(b.name);
   });
   return out;
 }
 
 function unwrap<T>(res: any): T | null {
-  if (res && typeof res === 'object' && 'result' in res) return (res.result ?? null) as T | null;
+  if (res && typeof res === 'object' && 'result' in res) {return (res.result ?? null) as T | null;}
   return (res ?? null) as T | null;
 }
 
@@ -66,6 +67,11 @@ function App(): React.JSX.Element {
   const [listError, setListError] = useState<string | null>(null);
   const [status, setStatus] = useState<string>('Navigate to a folder, then tap the button.');
   const [showHidden, setShowHidden] = useState<boolean>(false);
+  // On e-ink the screen lags the tap, so the button is often pressed again
+  // before the first linkLassoToCwd has finished — which wrote a second link
+  // onto the same strokes. One flight at a time; re-enabled on failure only,
+  // since success closes the view.
+  const [linking, setLinking] = useState<boolean>(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -73,7 +79,7 @@ function App(): React.JSX.Element {
       setListError(null);
       try {
         const files = (await FileUtils.listFiles(cwd)) as unknown as RawListItem[] | null | undefined;
-        if (cancelled) return;
+        if (cancelled) {return;}
         if (!files) {
           setEntries([]);
           setListError(`listFiles returned ${files === null ? 'null' : 'undefined'}`);
@@ -81,7 +87,7 @@ function App(): React.JSX.Element {
         }
         setEntries(normalizeEntries(files));
       } catch (e: any) {
-        if (!cancelled) setListError(`listFiles threw: ${e?.message ?? String(e)}`);
+        if (!cancelled) {setListError(`listFiles threw: ${e?.message ?? String(e)}`);}
       }
     })();
     return () => {
@@ -90,7 +96,7 @@ function App(): React.JSX.Element {
   }, [cwd]);
 
   const breadcrumb = useMemo(() => {
-    if (cwd === SUPERNOTE_ROOT) return 'Supernote/';
+    if (cwd === SUPERNOTE_ROOT) {return 'Supernote/';}
     const rel = cwd.startsWith(SUPERNOTE_ROOT + '/') ? cwd.slice(SUPERNOTE_ROOT.length + 1) : cwd;
     return 'Supernote/' + rel;
   }, [cwd]);
@@ -101,12 +107,16 @@ function App(): React.JSX.Element {
   );
 
   const goUp = () => {
-    if (cwd === SUPERNOTE_ROOT) return;
+    if (cwd === SUPERNOTE_ROOT) {return;}
     const parent = cwd.replace(/\/+$/, '').replace(/\/[^/]+$/, '');
     setCwd(parent || SUPERNOTE_ROOT);
   };
 
   const linkLassoToCwd = async () => {
+    if (linking) {
+      return;
+    }
+    setLinking(true);
     setStatus('Reading lasso context…');
     try {
       const [rectRes, pageRes, pathRes] = await Promise.all([
@@ -126,10 +136,12 @@ function App(): React.JSX.Element {
         typeof rect.bottom !== 'number'
       ) {
         setStatus(`No lasso rect: ${JSON.stringify(rect)}`);
+        setLinking(false);
         return;
       }
       if (typeof notePath !== 'string' || typeof page !== 'number') {
         setStatus(`Bad context: notePath=${notePath} page=${page}`);
+        setLinking(false);
         return;
       }
 
@@ -143,10 +155,14 @@ function App(): React.JSX.Element {
         setStatus(
           `Link FAIL code=${linkResult?.error?.code} msg=${linkResult?.error?.message}`,
         );
+        setLinking(false);
         return;
       }
 
-      await addShortcut({
+      // The link now lives in the note itself. Hold it in memory as well so the
+      // word is tappable before the note is next written to disk; the pending
+      // copy is dropped as soon as a read of the page reports the real link.
+      addPendingLink({
         notePath,
         page,
         left: rect.left,
@@ -156,12 +172,13 @@ function App(): React.JSX.Element {
         folderPath: cwd,
       });
 
-      DeviceEventEmitter.emit('folderLinkShortcutsChanged');
+      DeviceEventEmitter.emit('folderLinkChanged');
 
       setStatus(`OK: linked to ${cwd}. Closing…`);
       setTimeout(() => PluginManager.closePluginView(), 600);
     } catch (e: any) {
       setStatus(`Error: ${e?.message ?? String(e)}`);
+      setLinking(false);
     }
   };
 
@@ -192,7 +209,10 @@ function App(): React.JSX.Element {
         </Pressable>
       </View>
 
-      <Pressable style={styles.linkBtn} onPress={linkLassoToCwd}>
+      <Pressable
+        style={[styles.linkBtn, linking && styles.linkBtnBusy]}
+        onPress={linkLassoToCwd}
+        disabled={linking}>
         <Text style={styles.linkBtnText}>Link lasso → this folder</Text>
         <Text style={styles.linkBtnPath} numberOfLines={1}>
           {cwd}
@@ -296,6 +316,9 @@ const styles = StyleSheet.create({
     paddingVertical: 24,
     paddingHorizontal: 18,
     marginBottom: 12,
+  },
+  linkBtnBusy: {
+    opacity: 0.5,
   },
   linkBtnText: {
     color: '#ffffff',

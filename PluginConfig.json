@@ -1,6 +1,6 @@
 {
   "name": "Folder Shortcuts",
-  "desc": "Bookmark folders on your Supernote and jump to them from the sidebar.",
+  "desc": "Lasso a word, link it to a folder, and tap the word to jump there.",
   "iconPath": "assets/icon.png",
   "versionName": "0.2.0",
   "versionCode": "6",

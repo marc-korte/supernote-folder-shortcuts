@@ -107,7 +107,7 @@ fi
 
 # A leftover from the versions that laid invisible windows over each link: those
 # swallow finger events, which stops a linked object being dragged or resized.
-if [[ "$(grep -a -c "setOverlays wanted" "$LOG")" -eq 0 ]]; then
+if [[ "$(grep -a -c "setOverlays" "$LOG")" -eq 0 ]]; then
     check "no overlay windows in use" ok
 else
     check "no overlay windows in use" bad \

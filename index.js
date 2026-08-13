@@ -111,18 +111,23 @@ let measuredAt = 0;
 let loggedNoContext = false;
 
 // A refresh spans several bridge round-trips, and it is kicked off from the
-// heartbeat, the plugin view, the lifecycle callbacks and tap handling. Two
-// passes left to interleave could record the previous page's measurements after
-// the current page's and then claim that context as measured, with nothing
-// retrying. So passes are chained, and each one carries the sequence number it
-// was issued with: a pass superseded while it was waiting drops its results.
+// heartbeat, the plugin view, the lifecycle callbacks and tap handling. Passes
+// are chained so two of them cannot interleave, and a pass that is still
+// queued when a newer one arrives collapses into it (refreshSeq). Cancelling a
+// pass mid-flight is a separate, rarer thing (cancelSeq): ticks arrive every
+// 1.5s while a busy page can take longer than that to read, so cancelling on
+// every schedule would drop every pass before its results landed and the
+// motion listener would never arm. Only standDown cancels — a pass that
+// outlives a stop must not re-arm the listener behind it.
 let refreshSeq = 0;
+let cancelSeq = 0;
 let refreshChain = Promise.resolve();
 
 const standDown = () => {
   measuredKey = '';
   measuredAt = 0;
-  // Supersede any refresh still in flight so it cannot re-arm behind us.
+  // Cancel any refresh still in flight so it cannot re-arm behind us.
+  cancelSeq++;
   refreshSeq++;
   ensureMotionListener(false);
 };
@@ -133,10 +138,10 @@ const standDown = () => {
  * Nothing is installed on screen, so a refresh that arrives late is only ever
  * out of date, never wrong — the tap itself is checked against a fresh read.
  */
-const runRefresh = async (force, gen) => {
+const runRefresh = async (force, cancel) => {
   try {
     const ctx = await currentContext();
-    if (gen !== refreshSeq) {return;}
+    if (cancel !== cancelSeq) {return;}
     if (!ctx) {
       // Logged once per run of no-context passes: silence here is
       // indistinguishable from the refresh never being driven at all, which has
@@ -155,9 +160,9 @@ const runRefresh = async (force, gen) => {
     if (!force && key === measuredKey && !stale) {return;}
 
     const links = await readFolderLinks(ctx.notePath, ctx.page);
-    if (gen !== refreshSeq) {return;}
+    if (cancel !== cancelSeq) {return;}
     const scale = await scaleProbe(ctx.notePath, ctx.page);
-    if (gen !== refreshSeq) {return;}
+    if (cancel !== cancelSeq) {return;}
 
     measuredKey = key;
     measuredAt = Date.now();
@@ -171,8 +176,10 @@ const runRefresh = async (force, gen) => {
 
 const scheduleRefresh = (force = false) => {
   const gen = ++refreshSeq;
-  // A pass that was still queued when a newer one arrived has nothing to add.
-  const run = () => (gen === refreshSeq ? runRefresh(force, gen) : undefined);
+  const cancel = cancelSeq;
+  // A pass that was still queued when a newer one arrived has nothing to add —
+  // but once a pass has started, only a cancel stops its results landing.
+  const run = () => (gen === refreshSeq ? runRefresh(force, cancel) : undefined);
   refreshChain = refreshChain.then(run, run);
   return refreshChain;
 };

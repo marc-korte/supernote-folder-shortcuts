@@ -53,7 +53,10 @@ public class FolderLinkModule extends ReactContextBaseJavaModule {
     private static final long TICK_MS = 1500;
 
     private final Handler tickHandler = new Handler(Looper.getMainLooper());
-    private boolean alive = true;
+    // volatile: invalidate() runs off the main thread, and a tick already
+    // executing when it fires escapes removeCallbacks and re-posts itself. It
+    // must see the write on its next run or the heartbeat survives the module.
+    private volatile boolean alive = true;
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {

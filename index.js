@@ -419,6 +419,30 @@ let currentScale = {x: 1, y: 1};
 const recentlyOpened = () => Date.now() - lastOpenAt < 1000;
 
 /**
+ * Brings the next read forward after a drag, because a drag may have moved a
+ * linked object.
+ *
+ * Taps are hit-tested against the last read, so until the next one the plugin is
+ * holding the rectangle the object used to occupy: tapping the object does
+ * nothing and tapping where it was still opens the folder. Left to
+ * LINK_RECHECK_MS that lasts six seconds plus the read itself, which is two or
+ * three taps before the link answers.
+ *
+ * Rate-limited because this fires for every stroke: the listener is armed
+ * whenever the page has a link, so writing on such a page ends a drag
+ * constantly, and each re-read costs a second or more on a busy page.
+ */
+const DRAG_REREAD_MIN_INTERVAL_MS = 3000;
+let lastDragRereadAt = 0;
+
+const noteMayHaveMoved = () => {
+  const now = Date.now();
+  if (now - lastDragRereadAt < DRAG_REREAD_MIN_INTERVAL_MS) {return;}
+  lastDragRereadAt = now;
+  scheduleRefresh(true);
+};
+
+/**
  * How long after a touch its result may still be acted on.
  *
  * A touch resolved seconds late can land on a screen the user has moved on
@@ -515,6 +539,8 @@ const onMotion = async (e) => {
     const moved = Math.sqrt((e.x - down.x) ** 2 + (e.y - down.y) ** 2);
     penLog(`${tool} up at ${e.x},${e.y} after ${duration}ms, moved ${Math.round(moved)}px`);
     if (duration > TAP_MAX_DURATION_MS || moved > TAP_MAX_MOVEMENT_PX) {
+      // Distance, not duration: a long press that stayed put moved nothing.
+      if (moved > TAP_MAX_MOVEMENT_PX) {noteMayHaveMoved();}
       return penLog('not a tap');
     }
     if (uiSuppressed()) {return penLog('plugin UI suppressed navigation');}

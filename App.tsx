@@ -11,7 +11,7 @@
  *      finger tap works immediately.
  */
 
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {
   DeviceEventEmitter,
   FlatList,
@@ -21,7 +21,7 @@ import {
   View,
 } from 'react-native';
 import {FileUtils, PluginCommAPI, PluginManager, PluginNoteAPI} from 'sn-plugin-lib';
-import {addPendingLink} from './links';
+import {addPendingLink, usableLassoRect} from './links';
 
 const SUPERNOTE_ROOT = '/storage/emulated/0';
 const NOTE_DIR = SUPERNOTE_ROOT + '/Note';
@@ -29,6 +29,9 @@ const NOTE_DIR = SUPERNOTE_ROOT + '/Note';
 type Entry = {name: string; path: string; isFolder: boolean};
 
 type RawListItem = {type?: number; path?: string} | string | null | undefined;
+
+const IDLE_STATUS = 'Navigate to a folder, then tap the button.';
+const LASSO_LOST_STATUS = 'Lasso selection was lost. Close this picker, lasso the word again, then retry.';
 
 function basename(path: string): string {
   const trimmed = path.replace(/\/+$/, '');
@@ -65,13 +68,33 @@ function App(): React.JSX.Element {
   const [cwd, setCwd] = useState<string>(NOTE_DIR);
   const [entries, setEntries] = useState<Entry[]>([]);
   const [listError, setListError] = useState<string | null>(null);
-  const [status, setStatus] = useState<string>('Navigate to a folder, then tap the button.');
+  const [status, setStatus] = useState<string>(IDLE_STATUS);
   const [showHidden, setShowHidden] = useState<boolean>(false);
   // On e-ink the screen lags the tap, so the button is often pressed again
   // before the first linkLassoToCwd has finished — which wrote a second link
-  // onto the same strokes. One flight at a time; re-enabled on failure only,
-  // since success closes the view.
+  // onto the same strokes. One flight at a time; keep it set until the host has
+  // finished closing because closePluginView does not unmount the React tree.
   const [linking, setLinking] = useState<boolean>(false);
+  const [refreshCounter, setRefreshCounter] = useState<number>(0);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTouchAt = useRef<number>(0);
+  // Bumped every time the picker is shown or closed, so work started in one
+  // visit cannot apply its result during the next one.
+  const sessionRef = useRef<number>(0);
+
+  useEffect(() => {
+    const subscription = DeviceEventEmitter.addListener('folderLinkViewOpened', () => {
+      sessionRef.current += 1;
+      if (closeTimer.current !== null) {
+        clearTimeout(closeTimer.current);
+        closeTimer.current = null;
+      }
+      setLinking(false);
+      setStatus(IDLE_STATUS);
+      setRefreshCounter(value => value + 1);
+    });
+    return () => subscription.remove();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -93,7 +116,7 @@ function App(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [cwd]);
+  }, [cwd, refreshCounter]);
 
   const breadcrumb = useMemo(() => {
     if (cwd === SUPERNOTE_ROOT) {return 'Supernote/';}
@@ -116,6 +139,12 @@ function App(): React.JSX.Element {
     if (linking) {
       return;
     }
+    // Every await below can outlive the visit that started it — the user can
+    // close the picker mid-flight, and the host suspends this context while it
+    // is away. Anything this run does afterwards belongs to a visit that is
+    // over, so it must not touch the picker the user has since reopened.
+    const session = sessionRef.current;
+    const current = () => sessionRef.current === session;
     setLinking(true);
     setStatus('Reading lasso context…');
     try {
@@ -128,14 +157,11 @@ function App(): React.JSX.Element {
       const page = unwrap<number>(pageRes);
       const notePath = unwrap<string>(pathRes);
 
-      if (
-        !rect ||
-        typeof rect.left !== 'number' ||
-        typeof rect.right !== 'number' ||
-        typeof rect.top !== 'number' ||
-        typeof rect.bottom !== 'number'
-      ) {
-        setStatus(`No lasso rect: ${JSON.stringify(rect)}`);
+      if (!current()) {return;}
+
+      if (!usableLassoRect(rect)) {
+        console.log('[folder-link] getLassoRect returned no usable rect:', JSON.stringify(rect));
+        setStatus(LASSO_LOST_STATUS);
         setLinking(false);
         return;
       }
@@ -152,6 +178,7 @@ function App(): React.JSX.Element {
         linkType: 2,
       });
       if (linkResult && linkResult.success === false) {
+        if (!current()) {return;}
         setStatus(
           `Link FAIL code=${linkResult?.error?.code} msg=${linkResult?.error?.message}`,
         );
@@ -172,19 +199,67 @@ function App(): React.JSX.Element {
         folderPath: cwd,
       });
 
+      // The link is in the note whether or not this visit is still the current
+      // one, so it is recorded and announced either way.
       DeviceEventEmitter.emit('folderLinkChanged');
 
+      // Closing, though, is this visit's business. If the user already dismissed
+      // the picker, there is nothing of ours left to close.
+      if (!current()) {return;}
+
       setStatus(`OK: linked to ${cwd}. Closing…`);
-      setTimeout(() => PluginManager.closePluginView(), 600);
+      closeTimer.current = setTimeout(async () => {
+        closeTimer.current = null;
+        // Host timers are suspended while the view is closed, so this can only
+        // run once the picker is showing again — and that picker may belong to a
+        // later visit, which this one must not close or reset.
+        if (!current()) {return;}
+        DeviceEventEmitter.emit('folderLinkViewClosed');
+        try {
+          await PluginManager.closePluginView();
+        } catch (e: any) {
+          // Nothing here can retry a close the host refused, but the rejection
+          // has to be caught: this runs from a timer, so it would otherwise
+          // surface as an unhandled rejection with no context attached.
+          console.log('[folder-link] closePluginView failed:', e?.message ?? String(e));
+        } finally {
+          if (current()) {
+            setLinking(false);
+            setStatus(IDLE_STATUS);
+          }
+        }
+      }, 600);
     } catch (e: any) {
+      if (!current()) {return;}
       setStatus(`Error: ${e?.message ?? String(e)}`);
       setLinking(false);
     }
   };
 
+  const closePicker = () => {
+    sessionRef.current += 1;
+    if (closeTimer.current !== null) {
+      clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+    DeviceEventEmitter.emit('folderLinkViewClosed');
+    PluginManager.closePluginView();
+  };
+
+  const onStartShouldSetResponderCapture = () => {
+    const now = Date.now();
+    if (now - lastTouchAt.current >= 1000) {
+      lastTouchAt.current = now;
+      DeviceEventEmitter.emit('folderLinkViewTouched');
+    }
+    return false;
+  };
+
   return (
-    <View style={styles.container}>
-      <Pressable style={styles.closeButton} onPress={() => PluginManager.closePluginView()}>
+    <View
+      style={styles.container}
+      onStartShouldSetResponderCapture={onStartShouldSetResponderCapture}>
+      <Pressable style={styles.closeButton} onPress={closePicker}>
         <Text style={styles.closeText}>✕</Text>
       </Pressable>
 

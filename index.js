@@ -13,7 +13,7 @@ import {readFolderLinks, cachedLinksFor, invalidateCache, linkAt} from './links'
 // running either an installed package or a hot-reloaded debug bundle, and the
 // two are indistinguishable in the log without this — which has repeatedly made
 // it unclear whether a fix was actually under test.
-const BUILD_ID = '0.2.0';
+const BUILD_ID = '0.2.1';
 
 AppRegistry.registerComponent(appName, () => App);
 
@@ -37,6 +37,56 @@ PluginManager.registerButton(2, ['NOTE'], {
   icon: iconUri,
   enable: true,
   editDataTypes: [0, 3],
+});
+
+// ----- Not navigating while the plugin's own UI is up ----------------------
+//
+// Opening the picker from the lasso toolbar is itself a touch on the screen, and
+// the lasso menu appears right next to the word being lassoed — so the tap that
+// opens the picker used to be hit-tested against the note and open the link
+// underneath it. That threw the user into the file manager and destroyed the
+// lasso, which is why the picker then answered the link button with error 904.
+//
+// An expiry rather than a flag: the host can take the view away without the
+// picker ever running its own close path, and a flag left set that way would
+// kill every link tap until the plugin restarted. Touches inside the picker push
+// the deadline out, so browsing a deep folder tree cannot outlast it.
+const SUPPRESS_MAX_MS = 120000;
+let suppressUntil = 0;
+// Whether the picker is believed to be on screen. The deadline alone cannot say:
+// it lapses after a couple of idle minutes, and a touch arriving after that has
+// to be able to revive it rather than fall through to the note underneath.
+let pickerOpen = false;
+const uiSuppressed = () => Date.now() < suppressUntil;
+
+PluginManager.registerButtonListener({
+  onButtonPress: (event) => {
+    console.log(`[folder-link] plugin button press id=${event?.id}`);
+    // Only this plugin's own buttons; every listener hears every button event.
+    if (event?.id !== 100 && event?.id !== 200) {return;}
+    pickerOpen = true;
+    suppressUntil = Date.now() + SUPPRESS_MAX_MS;
+    DeviceEventEmitter.emit('folderLinkViewOpened');
+  },
+});
+
+// Only ever extends a window the picker is entitled to; a touch cannot arm
+// suppression once the picker is gone.
+DeviceEventEmitter.addListener('folderLinkViewTouched', () => {
+  if (pickerOpen) {
+    suppressUntil = Date.now() + SUPPRESS_MAX_MS;
+  }
+});
+
+// A grace period rather than a clear: closing the picker is a press on its ✕,
+// and that press arrives at the motion listener after this handler has run. Zero
+// it here and the closing tap navigates into whatever link sits beneath the
+// button.
+const CLOSE_GRACE_MS = 1500;
+DeviceEventEmitter.addListener('folderLinkViewClosed', () => {
+  pickerOpen = false;
+  suppressUntil = Math.min(suppressUntil, Date.now() + CLOSE_GRACE_MS);
+  console.log(`[folder-link] picker closed; suppression grace until ${suppressUntil}`);
 });
 
 const unwrap = (res) => (res && typeof res === 'object' && 'result' in res ? res.result : res);
@@ -108,7 +158,8 @@ const LINK_RECHECK_MS = 6000;
 // The page the cached scale and link list were measured for.
 let measuredKey = '';
 let measuredAt = 0;
-let loggedNoContext = false;
+let noContextSince = 0;
+const NO_CONTEXT_DISARM_MS = 60000;
 
 // A refresh spans several bridge round-trips, and it is kicked off from the
 // heartbeat, the plugin view, the lifecycle callbacks and tap handling. Passes
@@ -126,6 +177,9 @@ let refreshChain = Promise.resolve();
 const standDown = () => {
   measuredKey = '';
   measuredAt = 0;
+  noContextSince = 0;
+  pickerOpen = false;
+  suppressUntil = 0;
   // Cancel any refresh still in flight so it cannot re-arm behind us.
   cancelSeq++;
   refreshSeq++;
@@ -135,26 +189,29 @@ const standDown = () => {
 /**
  * Keeps two things current for the open page: the screen-to-page scale used to
  * place a tap, and whether the page has any folder link worth listening for.
- * Nothing is installed on screen, so a refresh that arrives late is only ever
- * out of date, never wrong — the tap itself is checked against a fresh read.
+ * Transient no-context reads are tolerated: the cached page and scale remain
+ * usable while the note activity recovers, and the tap path still refuses to
+ * navigate without a matching live context. Only sustained absence disarms the
+ * listener, because an excursion to the file manager otherwise creates a
+ * seconds-long blind window while the page is read again. The disarm threshold
+ * is one minute of wall-clock absence, not a number of heartbeat passes.
  */
 const runRefresh = async (force, cancel) => {
   try {
     const ctx = await currentContext();
     if (cancel !== cancelSeq) {return;}
     if (!ctx) {
-      // Logged once per run of no-context passes: silence here is
-      // indistinguishable from the refresh never being driven at all, which has
-      // already sent one diagnosis down the wrong path.
-      if (!loggedNoContext) {
-        loggedNoContext = true;
+      if (!noContextSince) {
+        noContextSince = Date.now();
         console.log('[folder-link] refresh: no note context');
       }
-      ensureMotionListener(false);
-      measuredKey = '';
+      if (Date.now() - noContextSince > NO_CONTEXT_DISARM_MS) {
+        ensureMotionListener(false);
+        measuredKey = '';
+      }
       return;
     }
-    loggedNoContext = false;
+    noContextSince = 0;
     const key = `${ctx.notePath}#${ctx.page}`;
     const stale = Date.now() - measuredAt > LINK_RECHECK_MS;
     if (!force && key === measuredKey && !stale) {return;}
@@ -418,6 +475,13 @@ const releaseTap = () => {
 
 const contextKey = (ctx) => (ctx ? `${ctx.notePath}#${ctx.page}` : '');
 
+const preNavCheck = async (expectedKey) => {
+  const ctx = await currentContext();
+  if (!running || contextKey(ctx) !== expectedKey) {return 'context';}
+  if (uiSuppressed()) {return 'suppressed';}
+  return null;
+};
+
 /**
  * The scale to convert this context's screen pixels into page coordinates.
  *
@@ -431,6 +495,9 @@ const scaleFor = async (ctx) =>
   contextKey(ctx) === measuredKey ? currentScale : scaleProbe(ctx.notePath, ctx.page);
 
 const onMotion = async (e) => {
+  // Only ever release a claim this handler took: the catch below must not clear
+  // the other path's claim on the way out.
+  let ownsTap = false;
   try {
     if (e?.toolType !== TOOL_STYLUS && e?.toolType !== TOOL_FINGER) {return;}
     if (e.action === ACTION_DOWN) {
@@ -450,9 +517,11 @@ const onMotion = async (e) => {
     if (duration > TAP_MAX_DURATION_MS || moved > TAP_MAX_MOVEMENT_PX) {
       return penLog('not a tap');
     }
+    if (uiSuppressed()) {return penLog('plugin UI suppressed navigation');}
     if (!running) {return penLog('plugin stopped, ignoring tap');}
     if (recentlyOpened()) {return penLog('already opened for this tap');}
     if (!claimTap()) {return penLog('PEN_UP owns this tap');}
+    ownsTap = true;
 
     const ctx = await currentContext();
     if (!ctx) {
@@ -470,24 +539,35 @@ const onMotion = async (e) => {
       return;
     }
 
-    // Re-check rather than trust the reads above: the page can turn, or the
-    // plugin stop, while they are in flight. Compared against the page this tap
-    // was resolved on, not against whatever the last refresh measured.
-    const stillHere = await currentContext();
-    if (!running || contextKey(stillHere) !== key) {
+    const reason = await preNavCheck(key);
+    if (reason === 'context') {
       releaseTap();
       return penLog('context moved on before opening');
     }
+    if (reason === 'suppressed') {
+      releaseTap();
+      return penLog('plugin UI suppressed navigation');
+    }
 
+    // Everything from here to navigate() is synchronous, deliberately. The age
+    // has to be measured after the last round trip or it does not account for
+    // it, and recentlyOpened() only excludes the other path if nothing awaits
+    // between the check and navigate() setting lastOpenAt.
     const age = Date.now() - tapAt;
     if (age > TAP_MAX_AGE_MS) {
       releaseTap();
       return penLog(`tap resolved ${age}ms late, too stale to act on`);
     }
+    if (recentlyOpened()) {
+      releaseTap();
+      return penLog('another path already opened this tap');
+    }
 
-    if (recentlyOpened()) {return penLog('another path already opened this tap');}
     await navigate(match, `${tool}-tap`);
   } catch (err) {
+    // A claim held past a thrown handler locks the other path out for the rest
+    // of the window while nothing navigates.
+    if (ownsTap) {releaseTap();}
     console.log('[folder-link] motion handler error:', err?.message ?? String(err));
   }
 };
@@ -549,6 +629,11 @@ PluginManager.registerEventListener(EventType.PEN_UP, 0, {
         return penLog(msg);
       };
 
+      // Suppression is deliberately not checked here, cheap though it is. The
+      // window outlives the picker by a grace period, and a pen tap arriving
+      // inside it landed on the note, not on plugin UI — bailing before the
+      // erase below would leave its ink dot behind. preNavCheck stops the
+      // navigation instead, once the dot is gone.
       const ctx = await currentContext();
       if (!ctx) {return giveUp('no note context');}
 
@@ -578,14 +663,19 @@ PluginManager.registerEventListener(EventType.PEN_UP, 0, {
         }
       }
 
-      // Erasing the dot above is another await, and the reads before it were
-      // more, so confirm the page is still the one this tap was resolved on
-      // before navigating — the user may have turned the page or left the note.
-      const stillHere = await currentContext();
-      if (!running || contextKey(stillHere) !== contextKey(ctx)) {
+      const reason = await preNavCheck(contextKey(ctx));
+      if (reason === 'context') {
         return giveUp('context moved on before opening; dot erased only');
       }
+      if (reason === 'suppressed') {
+        return giveUp('plugin UI suppressed navigation; dot erased only');
+      }
 
+      // Synchronous from here to navigate(), for the same reasons as the motion
+      // path: the age must cover preNavCheck's round trip, and recentlyOpened()
+      // only excludes the other path while nothing awaits before lastOpenAt is
+      // set.
+      //
       // Matching context is not enough on its own: leaving the note and coming
       // back lands on the same note and page, so a touch from before the
       // excursion would pass that check and navigate straight back out again.
@@ -593,11 +683,11 @@ PluginManager.registerEventListener(EventType.PEN_UP, 0, {
       if (age > TAP_MAX_AGE_MS) {
         return giveUp(`tap resolved ${age}ms late, too stale to act on; dot erased only`);
       }
-
       // Not owning the tap is not a reason to stop: the owner may have given up
       // on a context check without navigating, and this path has a real match in
       // hand. Only an open that actually happened rules this one out.
-      if (recentlyOpened()) {return penLog('another path already opened this tap; dot erased only');}
+      if (recentlyOpened()) {return giveUp('another path already opened this tap; dot erased only');}
+
       await navigate(match, 'pen_up');
     } catch (e) {
       console.log('[folder-link] PEN_UP handler error:', e?.message ?? String(e));

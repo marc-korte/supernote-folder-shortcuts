@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1
+
+- **The folder picker can be used repeatedly.** Closing the picker does not
+  unmount its React view, so a successful link could leave the button disabled
+  and the closing message stuck on the next visit. Picker state now resets when
+  it opens, refreshes its folder listing, and waits for the host close to finish
+  before re-enabling the link button.
+- **Picker UI no longer sends taps through to the note.** Opening either plugin
+  button starts a two-minute idle suppression window; touches while browsing
+  refresh that window, and closing leaves a short grace period for the close
+  tap itself. A lost lasso now shows a retry message instead of raw error 904.
+- **Folder links remain responsive after leaving and returning to a note.** A
+  transient missing note context no longer disarms the motion listener or drops
+  its measured page; only one minute without note context stands it down.
+
 ## 0.2.0
 
 Fixes both open issues, and replaces how links are stored and how taps are

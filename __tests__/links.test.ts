@@ -174,6 +174,29 @@ describe('readFolderLinks', () => {
   });
 });
 
+describe('usableLassoRect', () => {
+  it('requires all four numeric bounds', () => {
+    expect(links.usableLassoRect({left: 1, top: 2, right: 3, bottom: 4})).toBe(true);
+    expect(links.usableLassoRect({left: 1, top: 2, right: 3})).toBe(false);
+  });
+
+  it('rejects a rect that encloses nothing', () => {
+    expect(links.usableLassoRect({left: 0, top: 0, right: 0, bottom: 0})).toBe(false);
+    expect(links.usableLassoRect({left: 9, top: 2, right: 3, bottom: 4})).toBe(false);
+  });
+
+  it('rejects bounds that are not finite', () => {
+    expect(links.usableLassoRect({left: NaN, top: 2, right: 3, bottom: 4})).toBe(false);
+    expect(links.usableLassoRect({left: -Infinity, top: 2, right: 3, bottom: 4})).toBe(false);
+    expect(links.usableLassoRect({left: 1, top: 2, right: Infinity, bottom: 4})).toBe(false);
+  });
+
+  it('rejects an error response', () => {
+    expect(links.usableLassoRect(null)).toBe(false);
+    expect(links.usableLassoRect({error: {code: 904}, success: false})).toBe(false);
+  });
+});
+
 describe('pending links', () => {
   const pending = {
     notePath: NOTE,

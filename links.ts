@@ -32,6 +32,27 @@ const DEBUG_ELEMENTS = false;
 const unwrap = (res: any): any =>
   res && typeof res === 'object' && 'result' in res ? res.result : res;
 
+/**
+ * Whether getLassoRect returned a rectangle worth acting on.
+ *
+ * The bounds have to be finite and enclose something. An empty rect passes a
+ * bare type check but describes the top-left corner of the page, and an
+ * infinite one describes half of it; a pending link built from either answers
+ * to taps nowhere near the word — while never matching the real link, so it
+ * lingers for its full TTL.
+ */
+export const usableLassoRect = (value: any): boolean =>
+  Boolean(
+    value &&
+    typeof value === 'object' &&
+    Number.isFinite(value.left) &&
+    Number.isFinite(value.top) &&
+    Number.isFinite(value.right) &&
+    Number.isFinite(value.bottom) &&
+    value.right > value.left &&
+    value.bottom > value.top,
+  );
+
 // ----- folder-vs-file classification ---------------------------------------
 
 // The note app's own "link to document" also uses link type 2, so type alone
@@ -223,4 +244,3 @@ export const linkAt = (
   links.find(
     s => x >= s.left - pad && x <= s.right + pad && y >= s.top - pad && y <= s.bottom + pad,
   );
-

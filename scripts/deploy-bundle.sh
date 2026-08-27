@@ -21,6 +21,9 @@ PLUGIN_ID=$(node -p "require('./PluginConfig.json').pluginID")
 NAME=$(node -p "require('./package.json').name")
 DEVICE_DIR=/storage/emulated/0/MyStyle
 DEVICE_BUNDLE="$DEVICE_DIR/$NAME.bundle"
+# Matched against the stamp the reloaded bundle logs on load.
+BUILD_ID=$(sed -n "s/^const BUILD_ID = '\([^']*\)'.*/\1/p" index.js | head -1)
+RELOAD_TIMEOUT_S="${RELOAD_TIMEOUT_S:-15}"
 OUT=$(mktemp -d -t folder-link-bundle.XXXXXX)
 trap 'rm -rf "$OUT"' EXIT
 
@@ -40,13 +43,45 @@ npx react-native bundle \
 adb push "$OUT/$NAME.bundle" "$DEVICE_BUNDLE" >/dev/null
 echo "Pushed to $DEVICE_BUNDLE"
 
+# The host acknowledges nothing, so the only proof the swap took is the bundle
+# announcing itself on load. The stamp carries a version, not a bundle path, and
+# that version rarely changes between reloads, so a stamp left in the buffer by
+# the previous reload is indistinguishable from a fresh one. Clearing first is
+# what makes a later hit mean "this reload". A failed clear is fatal: the
+# confirmation below would otherwise read the old buffer and call a reload that
+# never happened a success.
+if ! adb logcat -c; then
+    echo "Could not clear the log buffer, so a reload cannot be confirmed." >&2
+    echo "$DEVICE_BUNDLE is pushed but was not loaded. Fix adb, then re-run." >&2
+    exit 1
+fi
+
 adb shell am broadcast \
     -n com.ratta.supernote.pluginhost/.receiver.PluginReceiver \
     -a com.ratta.supernote.plugin.action.DEBUG \
     --es bundle_path "$DEVICE_BUNDLE" \
     --es plugin_id "$PLUGIN_ID" >/dev/null
 
-echo "Reloaded. Confirm which build is live:"
-sleep 3
-adb logcat -d | grep -a "folder-link] build" | tail -1 | sed 's/^/  /' \
-    || echo "  (no build stamp — did the reload take?)"
+echo "Waiting up to ${RELOAD_TIMEOUT_S}s for the reloaded bundle to announce itself…"
+stamp=""
+for _ in $(seq 1 "$RELOAD_TIMEOUT_S"); do
+    sleep 1
+    stamp=$(adb logcat -d 2>/dev/null | grep -a "folder-link] build" | tail -1) || stamp=""
+    [[ -n "$stamp" ]] && break
+done
+
+if [[ -z "$stamp" ]]; then
+    echo "Reload not confirmed: nothing announced a build after the broadcast." >&2
+    echo "The host may have dropped it (is the plugin enabled?), or $DEVICE_BUNDLE failed to load." >&2
+    exit 1
+fi
+
+if [[ -n "$BUILD_ID" && "$stamp" != *"build $BUILD_ID"* ]]; then
+    echo "Reload announced a different build than the one just bundled (expected $BUILD_ID):" >&2
+    echo "  $stamp" >&2
+    exit 1
+fi
+
+echo "Reloaded. Live build:"
+echo "  $stamp"
+

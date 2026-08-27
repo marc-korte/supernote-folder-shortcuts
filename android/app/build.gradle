@@ -94,7 +94,6 @@ def processCustomApk(String buildType) {
         delete tempDir
     }
 }
-
 // Use Gradle configuration to avoid duplication
 ['Debug', 'Release'].each { variant ->
     def buildType = variant.toLowerCase()

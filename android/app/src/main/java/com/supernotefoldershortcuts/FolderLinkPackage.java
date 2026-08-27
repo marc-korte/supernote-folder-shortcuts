@@ -19,3 +19,4 @@ public class FolderLinkPackage implements ReactPackage {
         return Collections.emptyList();
     }
 }
+

@@ -42,10 +42,16 @@ fi
 
 echo "Which build is live (from the existing log buffer):"
 adb logcat -d 2>/dev/null | grep -a "folder-link] build" | tail -1 | sed 's/^/  /' \
-    || echo "  (no build stamp seen — deploy a build that logs BUILD_ID)"
+    || echo "  (no build stamp in the buffer — the plugin has not restarted since it was last cleared, which an earlier run of this script does. Not a fault by itself.)"
 
 echo
 echo "Watching the device for ${DURATION}s. Tap a folder link now, with finger and stylus."
+
+# Everything below counts records, and adb logcat replays the whole ring buffer
+# before it starts streaming. Without this the counts describe whatever the
+# device happened to log earlier: a previous build, a previous run of this
+# check, instead of the window we are about to watch.
+adb logcat -c 2>/dev/null || echo "  (could not clear the log buffer; counts may include older records)" >&2
 
 # macOS ships no timeout(1); coreutils provides it as gtimeout. Fall back to
 # running the capture in the background and stopping it here, which needs
@@ -68,6 +74,7 @@ cache_errors=$(grep -a -c "code=206" "$LOG")
 listener=$(grep -a -c "motion listener on" "$LOG")
 no_context=$(grep -a -c "refresh: no note context" "$LOG")
 opens=$(grep -a -c -- "-tap openFolder\|pen_up openFolder" "$LOG")
+motion_opens=$(grep -a -c -- "-tap openFolder" "$LOG")
 links_present=$(grep -a "folder-link] page " "$LOG" | grep -a -vc ", 0 folder links")
 
 echo
@@ -76,14 +83,23 @@ echo "Results over ${DURATION}s:"
 # The heartbeat is what keeps overlays in step with the open page. JS timers are
 # suspended while the plugin view is closed, so a JS-only interval goes quiet
 # during ordinary note-taking and the tap targets silently go stale.
-if [[ "$reads" -ge 2 ]]; then
-    check "heartbeat drives repeated page reads ($reads)" ok
+# A page read happens once per recheck interval (30s), so a short window
+# physically cannot contain two of them: asking for two here failed every run
+# that used the default duration. Ask for repetition only when the window is
+# long enough to show it; below that, one read still proves the tick fires.
+expected_reads=2
+if [[ "$DURATION" -lt 70 ]]; then
+    expected_reads=1
+fi
+
+if [[ "$reads" -ge "$expected_reads" ]]; then
+    check "heartbeat drives repeated page reads ($reads in ${DURATION}s)" ok
 elif [[ "$no_context" -gt 0 ]]; then
     check "heartbeat drives repeated page reads" bad \
         "Refreshes ran but found no note context. Is a note actually open?"
 else
     check "heartbeat drives repeated page reads" bad \
-        "Only $reads read(s). Refresh is not being driven — check the native tick."
+        "Only $reads read(s) in ${DURATION}s, expected $expected_reads. Refresh is not being driven — check the native tick."
 fi
 
 # Reading page elements caches trail data natively; without handing them back
@@ -98,11 +114,16 @@ fi
 # Both finger and stylus taps arrive through the motion listener, and it is only
 # registered while the open page has a link — so on a page that has one, its
 # absence means no tap can be handled at all.
-if [[ "$listener" -ge 1 ]] || grep -aq "motion listener on" <(adb logcat -d 2>/dev/null); then
+#
+# Only evidence from this capture counts. The old check fell back to the whole
+# persistent buffer, where a registration from a previous build passes for the
+# build under test. A "<tool>-tap openFolder" is equally good proof: that line
+# is only reached from the motion listener's own handler.
+if [[ "$listener" -ge 1 || "$motion_opens" -ge 1 ]]; then
     check "motion listener armed for the linked page" ok
 else
     check "motion listener armed for the linked page" bad \
-        "Never registered; neither finger nor stylus taps can be handled."
+        "Not registered during this window; neither finger nor stylus taps can be handled. If the note was already open before the check started, the listener may have armed earlier: turn the page and back, or tap a link, and re-run."
 fi
 
 # A leftover from the versions that laid invisible windows over each link: those
@@ -114,7 +135,12 @@ else
         "setOverlays is still being called; finger drags on a link will be blocked."
 fi
 
-if [[ "$links_present" -ge 1 ]]; then
+# A navigation is proof on its own, and it has to be accepted as proof: this
+# check asks for a page that has a link while the instructions above ask for
+# that link to be tapped, and tapping it opens the folder and leaves the note.
+# Every read after that is of somewhere else, so a successful tap test would
+# otherwise fail this check.
+if [[ "$links_present" -ge 1 || "$opens" -ge 1 ]]; then
     check "a folder link was found on the open page" ok
 else
     check "a folder link was found on the open page" bad \
@@ -140,3 +166,4 @@ fi
 echo
 echo "$pass passed, $fail failed"
 [[ "$fail" -eq 0 ]]
+

@@ -1,19 +1,13 @@
 package com.supernotefoldershortcuts;
 
-import android.app.Activity;
-import android.app.Application;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.WindowManager;
-
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Promise;
@@ -50,7 +44,10 @@ public class FolderLinkModule extends ReactContextBaseJavaModule {
      * native-to-JS events are still delivered (that is how PEN_UP arrives), so
      * this is the one tick that survives.
      */
-    private static final long TICK_MS = 1500;
+    // Context probes are cheap and no longer wait behind getElements. A
+    // half-second tick bounds listener recovery after returning from another
+    // activity without increasing the 30-second page-scan cadence.
+    private static final long TICK_MS = 500;
 
     private final Handler tickHandler = new Handler(Looper.getMainLooper());
     // volatile: invalidate() runs off the main thread, and a tick already
@@ -61,36 +58,22 @@ public class FolderLinkModule extends ReactContextBaseJavaModule {
         @Override
         public void run() {
             if (!alive) return;
-            // Nothing to maintain while the host is in the background, and the
-            // context APIs have no note to report on either.
-            if (hostVisible()) emitTick();
+            // The plugin view is normally paused while the user is looking at
+            // a note. That background state is exactly when link geometry and
+            // the motion listener must be maintained.
+            emitTick();
             tickHandler.postDelayed(this, TICK_MS);
         }
     };
 
-    private Application application;
-    private Application.ActivityLifecycleCallbacks lifecycleCallbacks;
-    private int resumedActivities = 0;
-    /**
-     * Only meaningful once an activity callback has actually fired: if the
-     * plugin turns out to run somewhere without activities of its own, the
-     * heartbeat keeps going rather than silently stopping forever.
-     */
-    private boolean lifecycleObserved = false;
-
     public FolderLinkModule(ReactApplicationContext reactContext) {
         super(reactContext);
-        registerLifecycleCallbacks(reactContext);
         tickHandler.postDelayed(tick, TICK_MS);
     }
 
     @Override
     public String getName() {
         return "FolderLinkNative";
-    }
-
-    private boolean hostVisible() {
-        return !lifecycleObserved || resumedActivities > 0;
     }
 
     private void emitTick() {
@@ -103,52 +86,11 @@ public class FolderLinkModule extends ReactContextBaseJavaModule {
         }
     }
 
-    private void registerLifecycleCallbacks(Context ctx) {
-        Context app = ctx.getApplicationContext();
-        if (!(app instanceof Application)) {
-            Log.i(TAG, "no Application context; heartbeat will not track foreground state");
-            return;
-        }
-        application = (Application) app;
-        lifecycleCallbacks = new Application.ActivityLifecycleCallbacks() {
-            @Override
-            public void onActivityResumed(@NonNull Activity activity) {
-                lifecycleObserved = true;
-                resumedActivities++;
-            }
-
-            @Override
-            public void onActivityPaused(@NonNull Activity activity) {
-                lifecycleObserved = true;
-                if (resumedActivities > 0) resumedActivities--;
-            }
-
-            @Override
-            public void onActivityCreated(@NonNull Activity activity, @Nullable Bundle state) {}
-
-            @Override
-            public void onActivityStarted(@NonNull Activity activity) {}
-
-            @Override
-            public void onActivityStopped(@NonNull Activity activity) {}
-
-            @Override
-            public void onActivitySaveInstanceState(@NonNull Activity activity, @NonNull Bundle out) {}
-
-            @Override
-            public void onActivityDestroyed(@NonNull Activity activity) {}
-        };
-        application.registerActivityLifecycleCallbacks(lifecycleCallbacks);
-    }
-
     @Override
     public void invalidate() {
         alive = false;
         tickHandler.removeCallbacks(tick);
-        if (application != null && lifecycleCallbacks != null) {
-            application.unregisterActivityLifecycleCallbacks(lifecycleCallbacks);
-            lifecycleCallbacks = null;
-        }
+        FingerMonitorReset.stop(getReactApplicationContext());
         super.invalidate();
     }
 
@@ -184,6 +126,42 @@ public class FolderLinkModule extends ReactContextBaseJavaModule {
         });
     }
 
+    /**
+     * A deadline that still fires while the plugin view is paused.
+     *
+     * React Native pauses its JavaScript timers whenever the picker is closed,
+     * but native-to-JS callbacks remain live (the heartbeat above relies on
+     * that). SDK context requests can be stranded during an activity handoff,
+     * so JavaScript races them against this native clock instead of waiting for
+     * the SDK's much longer request timeout and blocking every queued refresh.
+     */
+    @ReactMethod
+    public void delay(int milliseconds, Promise promise) {
+        int boundedDelay = Math.max(0, Math.min(milliseconds, 60_000));
+        // A timeout already queued when the module is destroyed must not call
+        // back into the React instance being torn down. Its JavaScript promise
+        // disappears with that instance, so there is nothing left to settle.
+        tickHandler.postDelayed(() -> {
+            if (alive) promise.resolve(true);
+        }, boundedDelay);
+    }
+
+    /** Renews the host's stale raw-input monitor after a document return. */
+    @ReactMethod
+    public void resetFingerMonitor(Promise promise) {
+        tickHandler.post(() -> {
+            if (!alive) return;
+            try {
+                FingerMonitorReset.reset(getReactApplicationContext());
+                Log.i(TAG, "finger tap fallback ready");
+                promise.resolve(true);
+            } catch (Exception e) {
+                Log.e(TAG, "finger monitor reset unavailable: " + e.getMessage(), e);
+                promise.resolve(false);
+            }
+        });
+    }
+
     /** Used to convert a touch in screen pixels into page coordinates. */
     @ReactMethod
     public void getDisplayMetrics(Promise promise) {
@@ -203,4 +181,5 @@ public class FolderLinkModule extends ReactContextBaseJavaModule {
             promise.reject("METRICS_FAILED", e);
         }
     }
+
 }

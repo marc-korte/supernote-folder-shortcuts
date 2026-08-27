@@ -133,6 +133,96 @@ describe('readFolderLinks', () => {
     await expect(links.readFolderLinks(NOTE, 0)).rejects.toThrow(/code=500/);
   });
 
+  it('drops both JS and native element caches during a note handoff', async () => {
+    mockGetElements.mockResolvedValue(ok([linkElement()]));
+    await links.readFolderLinks(NOTE, 0);
+    expect(links.cachedLinksFor(NOTE, 0)).toHaveLength(1);
+
+    links.resetElementCaches();
+
+    expect(mockClearElementCache).toHaveBeenCalledTimes(1);
+    expect(links.cachedLinksFor(NOTE, 0)).toBeNull();
+  });
+
+  // Heartbeat, drag completion, lifecycle and tap handling can all request the
+  // same page at once. The native SDK serialises these expensive reads, so
+  // starting duplicates turns one slow page into a several-second backlog.
+  it('shares one in-flight read for the same page generation', async () => {
+    let finishRead: (value: any) => void = () => undefined;
+    mockGetElements.mockReturnValue(
+      new Promise(resolve => {
+        finishRead = resolve;
+      }),
+    );
+
+    const first = links.readFolderLinks(NOTE, 0);
+    const second = links.readFolderLinks(NOTE, 0);
+
+    expect(mockGetElements).toHaveBeenCalledTimes(1);
+    finishRead(ok([linkElement()]));
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      expect.any(Array),
+      expect.any(Array),
+    ]);
+  });
+
+  // A read begun on note A may finish after note B has invalidated the cache.
+  // Its native elements still need recycling, but its link list must never be
+  // published as the current page.
+  it('does not publish a read invalidated while it was in flight', async () => {
+    let finishRead: (value: any) => void = () => undefined;
+    mockGetElements.mockReturnValue(
+      new Promise(resolve => {
+        finishRead = resolve;
+      }),
+    );
+
+    const staleRead = links.readFolderLinks(NOTE, 0);
+    links.resetElementCaches();
+    finishRead(ok([linkElement()]));
+    await staleRead;
+
+    expect(mockRecycleElement).toHaveBeenCalledWith('uuid-link');
+    expect(links.cachedLinksFor(NOTE, 0)).toBeNull();
+  });
+
+  // A possible lasso move invalidates work already reading the old geometry,
+  // but the last known rectangles remain useful until the replacement lands.
+  it('invalidates in-flight geometry without dropping the last good cache', async () => {
+    mockGetElements.mockResolvedValueOnce(ok([linkElement()]));
+    await links.readFolderLinks(NOTE, 0);
+
+    let finishRead: (value: any) => void = () => undefined;
+    mockGetElements.mockReturnValueOnce(
+      new Promise(resolve => {
+        finishRead = resolve;
+      }),
+    );
+    const staleRead = links.readFolderLinks(NOTE, 0);
+
+    links.invalidatePageReads();
+    finishRead(ok([linkElement({X: 500})]));
+    await staleRead;
+
+    expect(links.cachedLinksFor(NOTE, 0)?.[0].left).toBe(886);
+  });
+
+  it('does not publish a provisional lasso snapshot that loses a known link', async () => {
+    const firstLink = linkElement();
+    const secondLink = {
+      ...linkElement({X: 1200}),
+      uuid: 'uuid-link-2',
+    };
+    mockGetElements.mockResolvedValueOnce(ok([firstLink, secondLink]));
+    await links.readFolderLinks(NOTE, 0);
+
+    mockGetElements.mockResolvedValueOnce(ok([linkElement({X: 500})]));
+    await expect(links.readFolderLinks(NOTE, 0, 2)).resolves.toHaveLength(1);
+
+    expect(links.cachedLinksFor(NOTE, 0)).toHaveLength(2);
+    expect(links.cachedLinksFor(NOTE, 0)?.[0].left).toBe(886);
+  });
+
   // The note app's own "link to document" also uses link type 2, so the type
   // alone does not identify a folder link.
   it('ignores a type 2 link whose target is not a directory', async () => {
@@ -265,5 +355,24 @@ describe('linkAt', () => {
 
   it('does not match well outside the rect', () => {
     expect(links.linkAt([link], 400, 120)).toBeUndefined();
+  });
+
+  it('does not turn an ordinary cached miss into a full page read', async () => {
+    const moved = {...link, left: 500, right: 600};
+    const readFresh = jest.fn().mockResolvedValue([moved]);
+
+    await expect(
+      links.linkAtCachedOrFresh([link], 550, 120, readFresh),
+    ).resolves.toBeUndefined();
+    expect(readFresh).not.toHaveBeenCalled();
+  });
+
+  it('does not re-read when the cached rectangle already matches', async () => {
+    const readFresh = jest.fn().mockResolvedValue([]);
+
+    await expect(
+      links.linkAtCachedOrFresh([link], 150, 120, readFresh),
+    ).resolves.toBe(link);
+    expect(readFresh).not.toHaveBeenCalled();
   });
 });

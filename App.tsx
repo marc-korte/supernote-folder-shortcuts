@@ -75,25 +75,54 @@ function App(): React.JSX.Element {
   // onto the same strokes. One flight at a time; keep it set until the host has
   // finished closing because closePluginView does not unmount the React tree.
   const [linking, setLinking] = useState<boolean>(false);
+  // The guard has to hold across the same tick, and state does not: two presses
+  // flushed in one batch both read the pre-update value and both link. The
+  // state is kept alongside for the button's disabled/busy rendering.
+  const linkingRef = useRef<number | null>(null);
+  const linkingTokenRef = useRef<number>(0);
   const [refreshCounter, setRefreshCounter] = useState<number>(0);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Which linking run scheduled the pending close, so whoever cancels that
+  // close knows whose ownership is left stranded. Only ever set once a run has
+  // finished its native calls: while one is still in flight, ownership has to
+  // stay held or a second press could overlap its setLassoStrokeLink.
+  const closeOwnerRef = useRef<number | null>(null);
   const lastTouchAt = useRef<number>(0);
   // Bumped every time the picker is shown or closed, so work started in one
   // visit cannot apply its result during the next one.
   const sessionRef = useRef<number>(0);
+  // Native work may resolve after React has torn the picker down. Refs still
+  // need releasing in that case, but no state update may target the dead tree.
+  const mountedRef = useRef<boolean>(true);
 
   useEffect(() => {
+    mountedRef.current = true;
     const subscription = DeviceEventEmitter.addListener('folderLinkViewOpened', () => {
       sessionRef.current += 1;
       if (closeTimer.current !== null) {
         clearTimeout(closeTimer.current);
         closeTimer.current = null;
       }
-      setLinking(false);
-      setStatus(IDLE_STATUS);
+      // An owner recorded here has completed every native link call and was
+      // only holding the button for a now-cancelled close. An owner without a
+      // closeOwner is still inside setLassoStrokeLink and must remain claimed.
+      const strandedOwner = closeOwnerRef.current;
+      closeOwnerRef.current = null;
+      if (strandedOwner !== null) {stopLinking(strandedOwner);}
+      if (linkingRef.current === null) {setStatus(IDLE_STATUS);}
       setRefreshCounter(value => value + 1);
     });
-    return () => subscription.remove();
+    return () => {
+      mountedRef.current = false;
+      sessionRef.current += 1;
+      if (closeTimer.current !== null) {
+        clearTimeout(closeTimer.current);
+        closeTimer.current = null;
+      }
+      closeOwnerRef.current = null;
+      linkingRef.current = null;
+      subscription.remove();
+    };
   }, []);
 
   useEffect(() => {
@@ -129,6 +158,12 @@ function App(): React.JSX.Element {
     [entries, showHidden],
   );
 
+  const stopLinking = (owner?: number) => {
+    if (owner !== undefined && linkingRef.current !== owner) {return;}
+    linkingRef.current = null;
+    if (mountedRef.current) {setLinking(false);}
+  };
+
   const goUp = () => {
     if (cwd === SUPERNOTE_ROOT) {return;}
     const parent = cwd.replace(/\/+$/, '').replace(/\/[^/]+$/, '');
@@ -136,9 +171,12 @@ function App(): React.JSX.Element {
   };
 
   const linkLassoToCwd = async () => {
-    if (linking) {
+    if (linkingRef.current !== null) {
       return;
     }
+    const owner = ++linkingTokenRef.current;
+    linkingRef.current = owner;
+    const stopThisLinking = () => stopLinking(owner);
     // Every await below can outlive the visit that started it — the user can
     // close the picker mid-flight, and the host suspends this context while it
     // is away. Anything this run does afterwards belongs to a visit that is
@@ -157,17 +195,20 @@ function App(): React.JSX.Element {
       const page = unwrap<number>(pageRes);
       const notePath = unwrap<string>(pathRes);
 
-      if (!current()) {return;}
+      if (!current()) {
+        stopThisLinking();
+        return;
+      }
 
       if (!usableLassoRect(rect)) {
         console.log('[folder-link] getLassoRect returned no usable rect:', JSON.stringify(rect));
         setStatus(LASSO_LOST_STATUS);
-        setLinking(false);
+        stopThisLinking();
         return;
       }
       if (typeof notePath !== 'string' || typeof page !== 'number') {
         setStatus(`Bad context: notePath=${notePath} page=${page}`);
-        setLinking(false);
+        stopThisLinking();
         return;
       }
 
@@ -178,11 +219,14 @@ function App(): React.JSX.Element {
         linkType: 2,
       });
       if (linkResult && linkResult.success === false) {
-        if (!current()) {return;}
+        if (!current()) {
+          stopThisLinking();
+          return;
+        }
         setStatus(
           `Link FAIL code=${linkResult?.error?.code} msg=${linkResult?.error?.message}`,
         );
-        setLinking(false);
+        stopThisLinking();
         return;
       }
 
@@ -205,15 +249,26 @@ function App(): React.JSX.Element {
 
       // Closing, though, is this visit's business. If the user already dismissed
       // the picker, there is nothing of ours left to close.
-      if (!current()) {return;}
+      if (!current()) {
+        stopThisLinking();
+        return;
+      }
 
       setStatus(`OK: linked to ${cwd}. Closing…`);
+      // Every native call this run makes is done, so the claim it still holds
+      // is only guarding the close. Record it: if the close is cancelled, the
+      // canceller inherits the job of handing it back.
+      closeOwnerRef.current = owner;
       closeTimer.current = setTimeout(async () => {
         closeTimer.current = null;
         // Host timers are suspended while the view is closed, so this can only
         // run once the picker is showing again — and that picker may belong to a
         // later visit, which this one must not close or reset.
-        if (!current()) {return;}
+        if (!current()) {
+          if (closeOwnerRef.current === owner) {closeOwnerRef.current = null;}
+          stopThisLinking();
+          return;
+        }
         DeviceEventEmitter.emit('folderLinkViewClosed');
         try {
           await PluginManager.closePluginView();
@@ -222,28 +277,57 @@ function App(): React.JSX.Element {
           // has to be caught: this runs from a timer, so it would otherwise
           // surface as an unhandled rejection with no context attached.
           console.log('[folder-link] closePluginView failed:', e?.message ?? String(e));
+          // The canvas suppresses link taps while the picker is visible. We
+          // announced a close before asking the host so its closing tap could
+          // not leak through; restore the visible state when the host refuses.
+          if (current() && mountedRef.current) {
+            DeviceEventEmitter.emit('folderLinkViewOpened');
+          }
         } finally {
+          if (closeOwnerRef.current === owner) {closeOwnerRef.current = null;}
           if (current()) {
-            setLinking(false);
+            stopThisLinking();
             setStatus(IDLE_STATUS);
           }
         }
       }, 600);
     } catch (e: any) {
-      if (!current()) {return;}
+      if (!current()) {
+        stopThisLinking();
+        return;
+      }
       setStatus(`Error: ${e?.message ?? String(e)}`);
-      setLinking(false);
+      stopThisLinking();
     }
   };
 
   const closePicker = () => {
     sessionRef.current += 1;
+    // Cancelling a scheduled close destroys the only thing that would have
+    // released that run's claim. Null unless a run had got as far as scheduling
+    // one, so a press landing mid-flight leaves its claim alone.
+    const strandedOwner = closeOwnerRef.current;
     if (closeTimer.current !== null) {
       clearTimeout(closeTimer.current);
       closeTimer.current = null;
     }
     DeviceEventEmitter.emit('folderLinkViewClosed');
-    PluginManager.closePluginView();
+    PluginManager.closePluginView()
+      .then(() => {
+        // By token, not unconditionally: a visit boundary can begin while the
+        // close promise is pending, and releasing its newer claim would let a
+        // second setLassoStrokeLink overlap it.
+        if (closeOwnerRef.current === strandedOwner) {
+          closeOwnerRef.current = null;
+        }
+        if (strandedOwner !== null) {stopLinking(strandedOwner);}
+      })
+      .catch((e: any) => {
+        console.log('[folder-link] closePluginView failed:', e?.message ?? String(e));
+        if (mountedRef.current) {
+          DeviceEventEmitter.emit('folderLinkViewOpened');
+        }
+      });
   };
 
   const onStartShouldSetResponderCapture = () => {

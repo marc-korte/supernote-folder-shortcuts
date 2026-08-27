@@ -112,6 +112,19 @@ const sameSpot = (a: FolderLink, b: FolderLink): boolean =>
 let cacheKey = '';
 let cached: FolderLink[] = [];
 
+// Invalidating the cache starts a new publication generation. Native page
+// reads cannot be cancelled, so a read from the previous note may still finish
+// after a handoff; the generation prevents that late result from becoming the
+// current tap map. Reads for the same page and generation share one promise so
+// heartbeat, drag and lifecycle refreshes cannot build a native request queue.
+let cacheGeneration = 0;
+type InflightRead = {
+  generation: number;
+  minimumLinkCount: number;
+  promise: Promise<FolderLink[]>;
+};
+const inflightReads = new Map<string, InflightRead>();
+
 const contextKey = (notePath: string, page: number) => `${notePath}#${page}`;
 
 /** Native error 206: the element cache is full and getElements refuses to run. */
@@ -121,10 +134,10 @@ const ERR_TRAIL_CACHE_FULL = 206;
  * Every getElements call caches that page's trail data natively, and the cache
  * is not self-limiting: left alone it fills, after which getElements fails with
  * error 206 and this plugin goes blind — no links found and every tap rejected.
- * Since links are re-read on a timer and on every tap, the elements have to be
- * handed back as soon as their fields have been copied out.
+ * Since links are re-read on a timer and after linked-object moves, the
+ * elements have to be handed back as soon as their fields have been copied out.
  */
-const recycleElements = (elements: any[]): void => {
+export const recycleElements = (elements: any[]): void => {
   for (const el of elements) {
     if (typeof el?.uuid !== 'string' || !el.uuid) {continue;}
     try {
@@ -160,9 +173,11 @@ const getElements = async (notePath: string, page: number): Promise<any[]> => {
  * read, so callers can leave the previous link list alone rather than acting on
  * an empty page.
  */
-export const readFolderLinks = async (
+const readFolderLinksOnce = async (
   notePath: string,
   page: number,
+  generation: number,
+  minimumLinkCount: () => number,
 ): Promise<FolderLink[]> => {
   const elements = await getElements(notePath, page);
 
@@ -170,8 +185,9 @@ export const readFolderLinks = async (
   try {
     if (DEBUG_ELEMENTS) {
       for (const el of elements) {
-        if (!el?.link) {continue;}
-        console.log(`[folder-link] link el#${el.numInPage}: ${JSON.stringify(el.link)}`);
+        if (el?.link) {
+          console.log(`[folder-link] link el#${el.numInPage}: ${JSON.stringify(el.link)}`);
+        }
       }
     }
 
@@ -198,6 +214,16 @@ export const readFolderLinks = async (
     recycleElements(elements);
   }
 
+  // A read invalidated during getElements still returns its copied plain values
+  // to its original caller, but it must not mutate pending links or publish a
+  // cache entry for a context that has since moved on.
+  if (generation !== cacheGeneration) {
+    console.log(
+      `[folder-link] stale page read ignored for ${notePath}#${page} generation ${generation}`,
+    );
+    return links;
+  }
+
   // A pending link that the page now reports has been persisted, so it can be
   // dropped; one this read still cannot see stays pending and is merged in so
   // it keeps working until the note is saved, but only until its deadline.
@@ -218,6 +244,20 @@ export const readFolderLinks = async (
       .map(({expiresAt: _expiresAt, ...link}) => link),
   );
 
+  // While the note app commits a lasso move, getElements briefly excludes the
+  // selected object. Publishing that partial result drops its link from the
+  // tap map until the next periodic read. A drag caller supplies the number of
+  // links known before the move; return the copied snapshot for retry logic,
+  // but retain the last complete cache until that invariant holds again.
+  const minimum = minimumLinkCount();
+  if (merged.length < minimum) {
+    console.log(
+      `[folder-link] provisional page ${page} of ${notePath}: ${elements.length} elements, ` +
+        `${merged.length}/${minimum} folder links; retaining prior cache`,
+    );
+    return merged;
+  }
+
   cacheKey = contextKey(notePath, page);
   cached = merged;
   console.log(
@@ -226,13 +266,87 @@ export const readFolderLinks = async (
   return merged;
 };
 
+/**
+ * Reads every folder link on the page, sharing native work between callers.
+ *
+ * The SDK's getElements queue is the expensive resource here. A heartbeat that
+ * arrives while a drag refresh is reading the same page should observe the
+ * same result, not enqueue a duplicate read behind it.
+ */
+export const readFolderLinks = (
+  notePath: string,
+  page: number,
+  minimumLinkCount = 0,
+): Promise<FolderLink[]> => {
+  const key = contextKey(notePath, page);
+  const generation = cacheGeneration;
+  const existing = inflightReads.get(key);
+  if (existing?.generation === generation) {
+    // A drag guard arriving behind an ordinary caller strengthens the shared
+    // read before it reaches the publication point, without duplicating the
+    // expensive native getElements request.
+    existing.minimumLinkCount = Math.max(
+      existing.minimumLinkCount,
+      minimumLinkCount,
+    );
+    return existing.promise;
+  }
+
+  const inflight: InflightRead = {
+    generation,
+    minimumLinkCount,
+    promise: Promise.resolve([]),
+  };
+  let promise: Promise<FolderLink[]>;
+  promise = readFolderLinksOnce(
+    notePath,
+    page,
+    generation,
+    () => inflight.minimumLinkCount,
+  ).finally(() => {
+    // A reset may have installed a newer promise under the same page key. The
+    // older completion owns only its own entry and must not delete the newer
+    // generation's single-flight guard.
+    if (inflightReads.get(key)?.promise === promise) {
+      inflightReads.delete(key);
+    }
+  });
+  inflight.promise = promise;
+  inflightReads.set(key, inflight);
+  return promise;
+};
+
 /** Last successfully read page, or null if it was a different page. */
 export const cachedLinksFor = (notePath: string, page: number): FolderLink[] | null =>
   cacheKey === contextKey(notePath, page) ? cached : null;
 
+/** Invalidates native work already in flight while retaining last good links. */
+export const invalidatePageReads = (): void => {
+  cacheGeneration++;
+  // Existing promises remain alive so their elements are recycled, but new
+  // callers must not join work from the invalidated generation.
+  inflightReads.clear();
+};
+
 export const invalidateCache = (): void => {
+  invalidatePageReads();
   cacheKey = '';
   cached = [];
+};
+
+/**
+ * Drops both layers that can carry the previous note into a new note context.
+ * The SDK sometimes updates getCurrentFilePath before its native element cache
+ * changes pages; clearing only our JavaScript cache then lets getElements hand
+ * the old note's elements back under the new note's path.
+ */
+export const resetElementCaches = (): void => {
+  invalidateCache();
+  try {
+    PluginCommAPI.clearElementCache();
+  } catch (e: any) {
+    console.log('[folder-link] clearElementCache warn:', e?.message ?? String(e));
+  }
 };
 
 export const linkAt = (
@@ -244,3 +358,20 @@ export const linkAt = (
   links.find(
     s => x >= s.left - pad && x <= s.right + pad && y >= s.top - pad && y <= s.bottom + pad,
   );
+
+/**
+ * Uses only the cheap cached hit. An ordinary miss is not permission to scan
+ * the whole page: motion events also cover toolbar taps and handwriting, and
+ * each miss used to enqueue a multi-second getElements request. A lasso move
+ * marks the page dirty and schedules one shared background refresh separately.
+ */
+export const linkAtCachedOrFresh = async (
+  cachedLinks: FolderLink[],
+  x: number,
+  y: number,
+  _readFresh: () => Promise<FolderLink[]>,
+): Promise<FolderLink | undefined> => {
+  // Keep the callback in the signature for compatibility with older callers;
+  // deliberately do not invoke it on a miss.
+  return linkAt(cachedLinks, x, y);
+};

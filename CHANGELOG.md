@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.3.0
+
+- **Links stay tappable through intermittent note/document handoffs.** The SDK
+  can publish a new note path several seconds before its element cache changes
+  pages. Note transitions now clear the stale element cache and keep a
+  speculative listener through one bounded empty retry. PDF/EPUB excursions
+  retain the last good note snapshot and the SDK listener handle; removing the
+  final handle during a handoff was observed on hardware to produce UP-only
+  input after re-registration.
+- **A stranded SDK context request no longer blocks every later refresh for
+  30–60 seconds.** Context reads now have a two-second deadline driven by an
+  Android Handler, which still runs while Supernote pauses JavaScript timers.
+  Context probes run independently of slow page reads, page reads are
+  single-flight, and clean tap misses do not start another full-page scan.
+- **Lasso moves wait for a complete committed page snapshot.** While a moved
+  object remains selected, the Note app can repeatedly return the old link
+  rectangle—or temporarily return fewer links. Drag refreshes now keep the page
+  dirty until the rectangle actually changes, while preserving the old hit area
+  if the move is cancelled. Dirty state survives a PDF/EPUB excursion, so the
+  first tap after **Last Opened Note** uses the committed moved rectangle.
+- **The first finger tap after a document handoff no longer disappears.** Manta
+  firmware can suppress an unchanged raw touchscreen axis and deliver the SDK
+  listener only an orphan `UP` after returning from a PDF or EPUB. A narrow
+  read-only raw-input fallback retains the absolute axes across that handoff,
+  accepts only single-finger taps, and feeds complete taps through the same
+  context, scale, ownership, and hit-testing guards as SDK motion events.
+- **The raw-input fallback releases its reader on a defined path.** The reader
+  parked inside a blocking `read()`, and closing the stream from another thread
+  is not guaranteed to unblock a read already in progress on a character device.
+  It now waits in `poll()` on the device plus a wake pipe, and stopping it writes
+  one byte to that pipe, so the thread unwinds and closes its descriptor
+  deterministically. Verified on a Manta across repeated teardown cycles: one
+  reader thread, never more.
+- **Note handoffs wait for the native page, not only the reported path.** Live
+  traces showed provisional empty element pages at 531 ms and 1026 ms, with the
+  note finishing its load at 1525 ms. First reads now wait 2000 ms and reconfirm
+  the note/page before touching the native element cache.
+- **A tap queued behind one native page scan is no longer discarded at 800ms.**
+  A 957ms collision was measured on a 125-element Manta page. Clean taps now
+  have a two-second completion window, dirty drag geometry has four seconds,
+  and the ordinary full-page recheck interval is 30 seconds.
+- **Tap state and native element ownership are balanced on every exit path.**
+  `PEN_UP` payloads are recycled in a `finally`, cancelled gestures clear their
+  saved down event, and stamped tap claims can only be released by their owner,
+  including when either input handler throws.
+- **Page scale is not treated as measured until the SDK probe succeeds.** A
+  note/page handoff clears the previous scale instead of installing a fake 1:1
+  measurement, so the first tap on panels with different screen and page
+  coordinate spaces performs a real probe.
+- **The folder picker has an owner-stamped single-flight guard.** Rapid presses
+  cannot create duplicate links, and delayed work from an old picker visit
+  cannot clear or close a newer one. A rejected host close restores the
+  picker's input-suppression state, an in-flight SDK link remains claimed across
+  a close/reopen, and unmount cancels the delayed close callback.
+- **The SDK is pinned to the current `sn-plugin-lib` 0.1.65 release.** Motion
+  events use the pointer-array payload, lifecycle messages use the current
+  registration API, and unknown or long `PEN_UP` strokes are not treated as
+  taps.
+- **Hot-deploy verification can no longer pass on stale log output.** If the
+  device log cannot be cleared before a debug reload, deployment now stops
+  before broadcasting the bundle path instead of accepting an earlier build
+  stamp as proof that the new bundle loaded.
+
 ## 0.2.1
 
 - **The folder picker can be used repeatedly.** Closing the picker does not
@@ -79,8 +142,8 @@ hit-tested against the link's own rectangle, which follows the object.
 - Tested only on a Supernote Manta (A5X2). Page coordinates happen to be 1:1
   with screen pixels there; the scale is derived for other panels but untested,
   and zoom is not handled.
-- A link removed in the last few seconds can still fire once, until the next
-  refresh.
+- A link removed in the last 30 seconds can still fire once, until the next
+  periodic refresh.
 - A very short deliberate mark inside a link's rectangle can still be read as a
   tap.
 

@@ -87,13 +87,21 @@ echo "Results over ${DURATION}s:"
 # physically cannot contain two of them: asking for two here failed every run
 # that used the default duration. Ask for repetition only when the window is
 # long enough to show it; below that, one read still proves the tick fires.
+#
+# A "no note context" refresh is evidence the tick fired too: it means refresh()
+# ran and found nothing to read, not that it stopped running. Tapping a link
+# makes that the normal case, because opening the folder leaves the note for the
+# rest of the window, so a successful tap test would otherwise fail this check.
 expected_reads=2
 if [[ "$DURATION" -lt 70 ]]; then
     expected_reads=1
 fi
+refreshes=$((reads + no_context))
 
 if [[ "$reads" -ge "$expected_reads" ]]; then
     check "heartbeat drives repeated page reads ($reads in ${DURATION}s)" ok
+elif [[ "$refreshes" -ge "$expected_reads" && "$opens" -ge 1 ]]; then
+    check "heartbeat drives refreshes ($refreshes in ${DURATION}s; a tap left the note)" ok
 elif [[ "$no_context" -gt 0 ]]; then
     check "heartbeat drives repeated page reads" bad \
         "Refreshes ran but found no note context. Is a note actually open?"

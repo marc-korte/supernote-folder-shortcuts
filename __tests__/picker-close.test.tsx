@@ -23,7 +23,11 @@ jest.mock('sn-plugin-lib', () => ({
     recycleElement: jest.fn(),
     clearElementCache: jest.fn(),
   },
-  PluginManager: {closePluginView: (...a: any[]) => mockClosePluginView(...a)},
+  PluginManager: {
+    closePluginView: (...a: any[]) => mockClosePluginView(...a),
+    hasPermission: jest.fn(async () => 1),
+    requestPermission: jest.fn(async () => 1),
+  },
   PluginNoteAPI: {setLassoStrokeLink: (...a: any[]) => mockSetLassoStrokeLink(...a)},
   PluginFileAPI: {getElements: jest.fn(async () => ({result: []}))},
 }));
@@ -43,6 +47,10 @@ const buttonFor = (tree: any, label: string) => {
 
 const linkButton = (tree: any) => buttonFor(tree, 'Link lasso → this folder');
 const closeButton = (tree: any) => buttonFor(tree, '✕');
+const viewEvents = (emit: jest.SpyInstance) =>
+  emit.mock.calls
+    .map(call => call[0])
+    .filter(name => name === 'folderLinkViewClosed' || name === 'folderLinkViewOpened');
 
 const flush = async () => {
   await act(async () => {
@@ -96,7 +104,7 @@ test('a refused close hands the button back instead of stranding it', async () =
   await press(closeButton(tree));
 
   expect(linkButton(tree).props.disabled).toBe(false);
-  expect(emit.mock.calls.map(call => call[0]).slice(-2)).toEqual([
+  expect(viewEvents(emit).slice(-2)).toEqual([
     'folderLinkViewClosed',
     'folderLinkViewOpened',
   ]);
@@ -119,7 +127,7 @@ test('an automatic close refusal restores the visible picker state', async () =>
 
   expect(mockClosePluginView).toHaveBeenCalledTimes(1);
   expect(linkButton(tree).props.disabled).toBe(false);
-  expect(emit.mock.calls.map(call => call[0]).slice(-2)).toEqual([
+  expect(viewEvents(emit).slice(-2)).toEqual([
     'folderLinkViewClosed',
     'folderLinkViewOpened',
   ]);

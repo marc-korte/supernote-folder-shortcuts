@@ -2,9 +2,13 @@
   "name": "Folder Shortcuts",
   "desc": "Lasso a word, link it to a folder, and tap the word to jump there.",
   "iconPath": "assets/icon.png",
-  "versionName": "0.3.0",
-  "versionCode": "13",
+  "versionName": "0.3.1",
+  "versionCode": "14",
   "pluginID": "2b18jdjkh5madrzz",
   "pluginKey": "SupernoteFolderShortcuts",
-  "jsMainPath": "index"
+  "jsMainPath": "index",
+  "uses-permissions": [
+    "plugin.permission.FILE:READ",
+    "plugin.permission.FILE:WRITE"
+  ]
 }

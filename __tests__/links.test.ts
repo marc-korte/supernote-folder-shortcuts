@@ -133,6 +133,17 @@ describe('readFolderLinks', () => {
     await expect(links.readFolderLinks(NOTE, 0)).rejects.toThrow(/code=500/);
   });
 
+  it('preserves permission error 1503 so the runtime can stop background scans', async () => {
+    mockGetElements.mockResolvedValue({
+      success: false,
+      error: {code: 1503, message: 'File read permission has not been requested.'},
+    });
+
+    await expect(links.readFolderLinks(NOTE, 0)).rejects.toMatchObject({
+      code: 1503,
+    });
+  });
+
   it('drops both JS and native element caches during a note handoff', async () => {
     mockGetElements.mockResolvedValue(ok([linkElement()]));
     await links.readFolderLinks(NOTE, 0);

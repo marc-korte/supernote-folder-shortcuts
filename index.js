@@ -36,12 +36,13 @@ import {
   tapAgeLimit,
   waitForStableNoteContext,
 } from './runtime';
+import {hasFileReadPermission} from './permissions';
 
 // Bumped by hand whenever a build is handed to a device. The plugin host can be
 // running either an installed package or a hot-reloaded debug bundle, and the
 // two are indistinguishable in the log without this — which has repeatedly made
 // it unclear whether a fix was actually under test.
-const BUILD_ID = '0.3.0';
+const BUILD_ID = '0.3.1';
 
 AppRegistry.registerComponent(appName, () => App);
 
@@ -229,6 +230,8 @@ const LINK_RECHECK_MS = 30000;
 // The page the cached scale and link list were measured for.
 let measuredKey = '';
 let measuredAt = 0;
+let measuredScanDurationMs = 0;
+let measuredScanCompletedAt = 0;
 let noContextSince = 0;
 let documentExcursionPath = '';
 let settlingKey = '';
@@ -255,6 +258,10 @@ const pageScans = new Map();
 let followupScheduled = false;
 let refreshScheduler = null;
 let scheduleRefresh = () => Promise.resolve();
+let fileReadAllowed = false;
+// Permission events and lifecycle callbacks can overlap; only the newest host
+// response may publish access state.
+let fileReadCheckGeneration = 0;
 
 const EMPTY_TRANSITION_RETRY_MS = 500;
 
@@ -310,6 +317,8 @@ const observeContext = ctx => {
 const standDown = () => {
   measuredKey = '';
   measuredAt = 0;
+  measuredScanDurationMs = 0;
+  measuredScanCompletedAt = 0;
   noContextSince = 0;
   documentExcursionPath = '';
   settlingKey = '';
@@ -443,7 +452,9 @@ const scanPage = (ctx, key, generation, cancelled) => {
       settlingKey = '';
       transitionRetriesRemaining = 0;
       measuredKey = key;
-      measuredAt = Date.now();
+      measuredScanCompletedAt = Date.now();
+      measuredAt = measuredScanCompletedAt;
+      measuredScanDurationMs = measuredScanCompletedAt - startedAt;
       if (geometryDirtyKey === key) {geometryDirtyKey = '';}
       if (dragDirtyKey === key) {
         dragDirtyKey = '';
@@ -452,9 +463,21 @@ const scanPage = (ctx, key, generation, cancelled) => {
       }
       ensureMotionListener(links.length > 0);
       console.log(
-        `[folder-link] scan ${key} completed in ${Date.now() - startedAt}ms`,
+        `[folder-link] scan ${key} completed in ${measuredScanDurationMs}ms`,
       );
     } catch (e) {
+      if (e?.code === 1503) {
+        fileReadCheckGeneration++;
+        fileReadAllowed = false;
+        pageGeneration++;
+        pageScans.clear();
+        invalidatePageReads();
+        ensureMotionListener(false);
+        console.log(
+          '[folder-link] file read permission lost (code=1503); waiting for picker authorization',
+        );
+        return;
+      }
       if (!cancelled() && generation === pageGeneration) {
         measuredAt = 0;
       }
@@ -479,6 +502,7 @@ const scanPage = (ctx, key, generation, cancelled) => {
  */
 const runRefresh = async (ctx, {force, cancelled}) => {
   if (cancelled()) {return;}
+  if (!fileReadAllowed) {return;}
   if (!ctx) {
     if (!noContextSince) {
       noContextSince = Date.now();
@@ -598,7 +622,41 @@ refreshScheduler = createRefreshScheduler({
 });
 scheduleRefresh = (force = false) => refreshScheduler.schedule(force);
 
-scheduleRefresh(true);
+const refreshFileReadPermission = async () => {
+  const generation = ++fileReadCheckGeneration;
+  let allowed = false;
+  try {
+    allowed = await hasFileReadPermission();
+  } catch (error) {
+    console.log(
+      '[folder-link] file read permission check failed:',
+      error?.message ?? String(error),
+    );
+  }
+  if (generation !== fileReadCheckGeneration) {return fileReadAllowed;}
+  fileReadAllowed = allowed;
+  if (!fileReadAllowed) {
+    // A scan that began while access was valid must not re-arm the listener
+    // after this check has revoked it.
+    pageGeneration++;
+    pageScans.clear();
+    invalidatePageReads();
+    ensureMotionListener(false);
+    return false;
+  }
+  if (running) {scheduleRefresh(true);}
+  return fileReadAllowed;
+};
+
+refreshFileReadPermission();
+
+DeviceEventEmitter.addListener('folderLinkPermissionsGranted', () => {
+  refreshFileReadPermission();
+});
+
+DeviceEventEmitter.addListener('folderLinkPermissionsDenied', () => {
+  refreshFileReadPermission();
+});
 
 // Force a re-read after the plugin view saves a new link, even when the
 // note+page context is unchanged.
@@ -631,11 +689,16 @@ const openFolder = async (folderPath) => {
  * the existing scan; no second native read is created, and neither the old nor
  * new rectangle is trusted until the replacement snapshot lands.
  */
-const resolveLinkFast = async (ctx, x, y) => {
+const resolveLinkFast = async (ctx, x, y, pageScanPending = false) => {
+  if (!fileReadAllowed) {
+    return {match: null, waitedForDirty: false, waitedForPageScan: false};
+  }
   const key = contextKey(ctx);
   let waitedForDirty = false;
+  let waitedForPageScan = pageScanPending;
   if (geometryDirtyKey === key) {
     waitedForDirty = true;
+    waitedForPageScan = true;
     const scanKey = `${key}@${pageGeneration}`;
     const scan =
       pageScans.get(scanKey) ??
@@ -648,11 +711,15 @@ const resolveLinkFast = async (ctx, x, y) => {
       const baselineMatch = dragDirtyKey === key
         ? linkAt(dragBaselineLinks, x, y) ?? null
         : null;
-      return {match: baselineMatch, waitedForDirty};
+      return {match: baselineMatch, waitedForDirty, waitedForPageScan};
     }
   }
   const known = cachedLinksFor(ctx.notePath, ctx.page);
-  return {match: known ? linkAt(known, x, y) ?? null : null, waitedForDirty};
+  return {
+    match: known ? linkAt(known, x, y) ?? null : null,
+    waitedForDirty,
+    waitedForPageScan,
+  };
 };
 
 // Assume running until the host says otherwise: the lifecycle callback may only
@@ -671,11 +738,11 @@ let running = true;
 // keep timers running. Page work is single-flight, so a duplicate tick can
 // probe context without duplicating getElements.
 DeviceEventEmitter.addListener('folderLinkTick', () => {
-  if (running) {scheduleRefresh();}
+  if (running && fileReadAllowed) {scheduleRefresh();}
 });
 
 setInterval(() => {
-  if (running) {scheduleRefresh();}
+  if (running && fileReadAllowed) {scheduleRefresh();}
 }, 1500);
 
 // Stop listening for taps when the plugin is stopped.
@@ -694,14 +761,14 @@ try {
         dragDirtyKey = '';
         dragMinimumLinkCount = 0;
         dragBaselineLinks = [];
-        scheduleRefresh(true);
+        refreshFileReadPermission();
       } else if (action === 'background') {
         // Closing the picker puts the plugin view in state 3, but the note is
         // precisely where its tap listener has to remain active. Bring the
         // newly written link into the cache before the JS context is paused.
         console.log('[folder-link] plugin life: background');
         running = true;
-        scheduleRefresh(true);
+        if (fileReadAllowed) {scheduleRefresh(true);}
       } else if (action === 'stop') {
         console.log('[folder-link] plugin life: stop');
         running = false;
@@ -912,6 +979,7 @@ const contextKey = (ctx) => (ctx ? `${ctx.notePath}#${ctx.page}` : '');
 const preNavCheck = (expectedKey, expectedEpoch, expectedInput) => {
   if (
     !running ||
+    !fileReadAllowed ||
     contextKey(activeNoteContext) !== expectedKey ||
     contextEpoch !== expectedEpoch ||
     (typeof expectedInput === 'number' && inputSeq !== expectedInput)
@@ -940,6 +1008,10 @@ const onMotion = async (e) => {
   try {
     const motion = normalizeMotionEvent(e);
     if (motion.toolType !== TOOL_STYLUS && motion.toolType !== TOOL_FINGER) {return;}
+    if (!fileReadAllowed) {
+      penDown = null;
+      return;
+    }
     if (motion.pointerCount !== 1) {
       penDown = null;
       return;
@@ -976,6 +1048,9 @@ const onMotion = async (e) => {
 
     const tool = motion.toolType === TOOL_FINGER ? 'finger' : 'stylus';
     const tapAt = Date.now();
+    const activeKeyAtTap = contextKey(activeNoteContext);
+    const pageScanPending = Boolean(activeKeyAtTap) &&
+      pageScans.has(`${activeKeyAtTap}@${pageGeneration}`);
     const duration = motion.eventTime - down.t;
     const moved = Math.sqrt((motion.x - down.x) ** 2 + (motion.y - down.y) ** 2);
     penLog(
@@ -1010,7 +1085,12 @@ const onMotion = async (e) => {
     const scale = await scaleFor(ctx);
     const x = motion.x / (scale.x || 1);
     const y = motion.y / (scale.y || 1);
-    const {match, waitedForDirty} = await resolveLinkFast(ctx, x, y);
+    const {match, waitedForDirty, waitedForPageScan} = await resolveLinkFast(
+      ctx,
+      x,
+      y,
+      pageScanPending && activeKeyAtTap === key,
+    );
     if (!match) {
       releaseTap(ownsTap);
       console.log(`[folder-link] ${tool} tap at ${x},${y} matched no link`);
@@ -1032,10 +1112,19 @@ const onMotion = async (e) => {
     // it, and recentlyOpened() only excludes the other path if nothing awaits
     // between the check and navigate() setting lastOpenAt.
     const age = Date.now() - tapAt;
-    const maxAge = tapAgeLimit(waitedForDirty);
+    const scanCompletedDuringTap = measuredKey === key &&
+      measuredScanCompletedAt >= tapAt;
+    const maxAge = tapAgeLimit(
+      waitedForPageScan || scanCompletedDuringTap,
+      measuredKey === key ? measuredScanDurationMs : 0,
+    );
     if (age > maxAge) {
       releaseTap(ownsTap);
-      return penLog(`tap resolved ${age}ms late, too stale to act on`);
+      console.log(
+        `[folder-link] ${tool} tap resolved ${age}ms late; ` +
+        `limit ${maxAge}ms, too stale to act on`,
+      );
+      return;
     }
     if (recentlyOpened()) {
       releaseTap(ownsTap);
@@ -1132,12 +1221,16 @@ PluginManager.registerEventListener(EventType.PEN_UP, 0, {
     const list = Array.isArray(data) ? data : [];
     let ownsTap = 0;
     try {
+      if (!fileReadAllowed) {return penLog('file read permission unavailable, ignoring tap');}
       // Stamped before the first await: everything below it — the stroke size
       // probe, the context reads, erasing the dot — is a round trip, and their
       // total is what let a touch be acted on long after the user had moved on.
       const tapAt = Date.now();
       const tapEpoch = contextEpoch;
       const tapInput = inputSeq;
+      const activeKeyAtTap = contextKey(activeNoteContext);
+      const pageScanPending = Boolean(activeKeyAtTap) &&
+        pageScans.has(`${activeKeyAtTap}@${pageGeneration}`);
       penLog(
         `event with ${list.length} element(s): ${list
           .map((e) => `#${e?.numInPage}/type=${e?.type}/pt=${JSON.stringify(extractTapPoint(e))}`)
@@ -1187,7 +1280,12 @@ PluginManager.registerEventListener(EventType.PEN_UP, 0, {
           known ? JSON.stringify(known.map((l) => [l.left, l.top, l.right, l.bottom])) : 'none'
         }`,
       );
-      const {match, waitedForDirty} = await resolveLinkFast(ctx, tap.x, tap.y);
+      const {match, waitedForDirty, waitedForPageScan} = await resolveLinkFast(
+        ctx,
+        tap.x,
+        tap.y,
+        pageScanPending && activeKeyAtTap === key,
+      );
       if (!match) {return giveUp('no link at tap');}
 
       // Erase the tap dot before navigating; once the file manager is in the
@@ -1216,9 +1314,18 @@ PluginManager.registerEventListener(EventType.PEN_UP, 0, {
       // back lands on the same note and page, so a touch from before the
       // excursion would pass that check and navigate straight back out again.
       const age = Date.now() - tapAt;
-      const maxAge = tapAgeLimit(waitedForDirty);
+      const scanCompletedDuringTap = measuredKey === key &&
+        measuredScanCompletedAt >= tapAt;
+      const maxAge = tapAgeLimit(
+        waitedForPageScan || scanCompletedDuringTap,
+        measuredKey === key ? measuredScanDurationMs : 0,
+      );
       if (age > maxAge) {
-        return giveUp(`tap resolved ${age}ms late, too stale to act on; dot erased only`);
+        console.log(
+          `[folder-link] pen_up tap resolved ${age}ms late; ` +
+          `limit ${maxAge}ms, too stale to act on; dot erased only`,
+        );
+        return giveUp('stale tap');
       }
       // Not owning the tap is not a reason to stop: the owner may have given up
       // on a context check without navigating, and this path has a real match in

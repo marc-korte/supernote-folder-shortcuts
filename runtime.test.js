@@ -288,8 +288,18 @@ describe('tap freshness', () => {
     expect(tapAgeLimit(false)).toBeLessThan(2500);
   });
 
-  test('allows the longer shared refresh only for known dirty geometry', () => {
+  test('allows a longer budget only for a known page scan', () => {
     expect(tapAgeLimit(true)).toBeGreaterThan(tapAgeLimit(false));
+  });
+
+  test('sizes a page-scan tap budget for a measured large note', () => {
+    expect(tapAgeLimit(true, 11900)).toBe(13900);
+    expect(tapAgeLimit(false, 11900)).toBe(2000);
+  });
+
+  test('ignores invalid page-scan measurements', () => {
+    expect(tapAgeLimit(true, Number.NaN)).toBe(4000);
+    expect(tapAgeLimit(true, -1)).toBe(4000);
   });
 });
 

@@ -203,10 +203,17 @@ export const waitForStableNoteContext = async ({
  * A clean cached hit can still queue behind one native getElements request;
  * 957ms was measured on a 125-element Manta page. Two seconds admits that one
  * device round trip while still rejecting the older multi-second replays that
- * originally motivated the guard. Dirty geometry already has stricter context
- * and input-epoch checks and may wait for its shared replacement scan.
+ * originally motivated the guard. A tap known to overlap a page scan keeps the
+ * same two-second margin beyond that page's observed scan time; context and
+ * input-epoch checks still reject a tap if the user moves on while it waits.
  */
-export const tapAgeLimit = waitedForDirty => waitedForDirty ? 4000 : 2000;
+export const tapAgeLimit = (waitedForPageScan, observedScanMs = 0) => {
+  if (!waitedForPageScan) {return 2000;}
+  const scanMs = Number.isFinite(observedScanMs) && observedScanMs > 0
+    ? Math.ceil(observedScanMs)
+    : 0;
+  return Math.max(4000, scanMs + 2000);
+};
 
 /**
  * Races an SDK request against a deadline supplied by the native module.

@@ -11,7 +11,7 @@
  *      finger tap works immediately.
  */
 
-import React, {useEffect, useMemo, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   DeviceEventEmitter,
   FlatList,
@@ -22,6 +22,7 @@ import {
 } from 'react-native';
 import {FileUtils, PluginCommAPI, PluginManager, PluginNoteAPI} from 'sn-plugin-lib';
 import {addPendingLink, usableLassoRect} from './links';
+import {ensureFilePermissions} from './permissions';
 
 const SUPERNOTE_ROOT = '/storage/emulated/0';
 const NOTE_DIR = SUPERNOTE_ROOT + '/Note';
@@ -31,6 +32,7 @@ type Entry = {name: string; path: string; isFolder: boolean};
 type RawListItem = {type?: number; path?: string} | string | null | undefined;
 
 const IDLE_STATUS = 'Navigate to a folder, then tap the button.';
+const CHECKING_PERMISSIONS_STATUS = 'Checking file access…';
 const LASSO_LOST_STATUS = 'Lasso selection was lost. Close this picker, lasso the word again, then retry.';
 
 function basename(path: string): string {
@@ -68,7 +70,8 @@ function App(): React.JSX.Element {
   const [cwd, setCwd] = useState<string>(NOTE_DIR);
   const [entries, setEntries] = useState<Entry[]>([]);
   const [listError, setListError] = useState<string | null>(null);
-  const [status, setStatus] = useState<string>(IDLE_STATUS);
+  const [status, setStatus] = useState<string>(CHECKING_PERMISSIONS_STATUS);
+  const [permissionsReady, setPermissionsReady] = useState<boolean>(false);
   const [showHidden, setShowHidden] = useState<boolean>(false);
   // On e-ink the screen lags the tap, so the button is often pressed again
   // before the first linkLassoToCwd has finished — which wrote a second link
@@ -94,6 +97,38 @@ function App(): React.JSX.Element {
   // Native work may resolve after React has torn the picker down. Refs still
   // need releasing in that case, but no state update may target the dead tree.
   const mountedRef = useRef<boolean>(true);
+  const permissionRunRef = useRef<number>(0);
+
+  const requestFilePermissions = useCallback(async () => {
+    const run = ++permissionRunRef.current;
+    if (mountedRef.current) {
+      setPermissionsReady(false);
+      setListError(null);
+      setStatus(CHECKING_PERMISSIONS_STATUS);
+    }
+
+    const result = await ensureFilePermissions();
+    if (!mountedRef.current || permissionRunRef.current !== run) {return;}
+
+    if (!result.granted) {
+      const kind = result.permission.endsWith(':READ') ? 'read' : 'write';
+      setPermissionsReady(false);
+      setEntries([]);
+      setListError(
+        `Folder Shortcuts needs file ${kind} access. ${result.message} ` +
+        'Tap Close, reopen the picker, and allow access to continue.',
+      );
+      setStatus('File access is required before a folder link can be created.');
+      DeviceEventEmitter.emit('folderLinkPermissionsDenied');
+      return;
+    }
+
+    setPermissionsReady(true);
+    setListError(null);
+    if (linkingRef.current === null) {setStatus(IDLE_STATUS);}
+    setRefreshCounter(value => value + 1);
+    DeviceEventEmitter.emit('folderLinkPermissionsGranted');
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -109,12 +144,13 @@ function App(): React.JSX.Element {
       const strandedOwner = closeOwnerRef.current;
       closeOwnerRef.current = null;
       if (strandedOwner !== null) {stopLinking(strandedOwner);}
-      if (linkingRef.current === null) {setStatus(IDLE_STATUS);}
-      setRefreshCounter(value => value + 1);
+      requestFilePermissions();
     });
+    requestFilePermissions();
     return () => {
       mountedRef.current = false;
       sessionRef.current += 1;
+      permissionRunRef.current += 1;
       if (closeTimer.current !== null) {
         clearTimeout(closeTimer.current);
         closeTimer.current = null;
@@ -123,9 +159,10 @@ function App(): React.JSX.Element {
       linkingRef.current = null;
       subscription.remove();
     };
-  }, []);
+  }, [requestFilePermissions]);
 
   useEffect(() => {
+    if (!permissionsReady) {return;}
     let cancelled = false;
     (async () => {
       setListError(null);
@@ -145,7 +182,7 @@ function App(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [cwd, refreshCounter]);
+  }, [cwd, permissionsReady, refreshCounter]);
 
   const breadcrumb = useMemo(() => {
     if (cwd === SUPERNOTE_ROOT) {return 'Supernote/';}
@@ -171,7 +208,7 @@ function App(): React.JSX.Element {
   };
 
   const linkLassoToCwd = async () => {
-    if (linkingRef.current !== null) {
+    if (!permissionsReady || linkingRef.current !== null) {
       return;
     }
     const owner = ++linkingTokenRef.current;
@@ -369,9 +406,12 @@ function App(): React.JSX.Element {
       </View>
 
       <Pressable
-        style={[styles.linkBtn, linking && styles.linkBtnBusy]}
+        style={[
+          styles.linkBtn,
+          (linking || !permissionsReady) && styles.linkBtnBusy,
+        ]}
         onPress={linkLassoToCwd}
-        disabled={linking}>
+        disabled={linking || !permissionsReady}>
         <Text style={styles.linkBtnText}>Link lasso → this folder</Text>
         <Text style={styles.linkBtnPath} numberOfLines={1}>
           {cwd}

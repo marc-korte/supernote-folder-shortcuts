@@ -162,7 +162,11 @@ const getElements = async (notePath: string, page: number): Promise<any[]> => {
     res = await PluginFileAPI.getElements(page, notePath);
   }
   if (res && res.success === false) {
-    throw new Error(`getElements failed code=${res?.error?.code} msg=${res?.error?.message}`);
+    const error: Error & {code?: number} = new Error(
+      `getElements failed code=${res?.error?.code} msg=${res?.error?.message}`,
+    );
+    error.code = res?.error?.code;
+    throw error;
   }
   const raw = unwrap(res);
   return Array.isArray(raw) ? raw : [];

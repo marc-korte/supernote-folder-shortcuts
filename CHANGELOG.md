@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.1
+
+- **Restores the folder picker and link taps on Chauvet 3.29.43.** The firmware
+  now blocks shared-storage reads and writes until a plugin declares and
+  requests them. Folder Shortcuts declares `FILE:READ` and `FILE:WRITE`, asks
+  for both when the picker opens, and keeps folder browsing/link creation
+  disabled with an actionable message until access is granted.
+- **Missing permission no longer floods the native page reader.** Background
+  scans stand down when read access is absent or error 1503 reports that it was
+  revoked, then resume as soon as the picker receives authorization.
+- **Large notes no longer discard a tap that overlaps their page scan.** The
+  ordinary two-second stale-tap guard remains fixed, while a known in-flight
+  scan uses that page's measured duration plus the same safety margin. Context,
+  input, and picker-state checks still reject taps after the user moves on.
+- **The package is built against `sn-plugin-lib` 0.1.65.** A clean dependency
+  install is required before packaging so the bundle reports the SDK expected
+  by the `.43` plugin host.
+
 ## 0.3.0
 
 - **Links stay tappable through intermittent note/document handoffs.** The SDK

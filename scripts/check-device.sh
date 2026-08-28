@@ -71,6 +71,7 @@ fi
 plugin_lines=$(grep -a -c "folder-link" "$LOG")
 reads=$(grep -a -c "folder-link] page " "$LOG")
 cache_errors=$(grep -a -c "code=206" "$LOG")
+permission_errors=$(grep -a -c "code=1503" "$LOG")
 listener=$(grep -a -c "motion listener on" "$LOG")
 no_context=$(grep -a -c "refresh: no note context" "$LOG")
 opens=$(grep -a -c -- "-tap openFolder\|pen_up openFolder" "$LOG")
@@ -117,6 +118,16 @@ if [[ "$cache_errors" -eq 0 ]]; then
 else
     check "no element-cache exhaustion (error 206)" bad \
         "$cache_errors failures. Elements are not being recycled after a read."
+fi
+
+# Chauvet .43 enforces the file permissions declared in PluginConfig.json.
+# Without a granted FILE:READ permission, every page scan fails with 1503 and
+# the plugin appears to load while its shortcuts are completely inactive.
+if [[ "$permission_errors" -eq 0 ]]; then
+    check "file-read permission accepted (no error 1503)" ok
+else
+    check "file-read permission accepted (no error 1503)" bad \
+        "$permission_errors failures. Reopen the picker and grant Folder Shortcuts file access."
 fi
 
 # Both finger and stylus taps arrive through the motion listener, and it is only
@@ -174,4 +185,3 @@ fi
 echo
 echo "$pass passed, $fail failed"
 [[ "$fail" -eq 0 ]]
-

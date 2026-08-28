@@ -13,8 +13,10 @@ or the pen opens the target folder.
 
 1. In a note, lasso the object to link.
 2. Open the lasso toolbar's three-dot menu and tap **Link to folder**.
-3. Navigate to the target folder, then tap **Link lasso → this folder**.
-4. Tap the linked object with a finger or the pen to open the folder.
+3. On Chauvet 3.29.43 or later, grant file read and write access when prompted.
+   **Always allow** keeps existing shortcuts active after the plugin UI closes.
+4. Navigate to the target folder, then tap **Link lasso → this folder**.
+5. Tap the linked object with a finger or the pen to open the folder.
 
 The picker starts in `Note/` and can navigate up to the Supernote storage root.
 The `Hidden` checkbox shows names beginning with a dot.
@@ -98,7 +100,9 @@ to `build/outputs/SupernoteFolderShortcuts.snplg`.
 ## Install
 
 Copy the package to the device's `/MyStyle/` folder, then install or update it
-from Supernote's plugin manager.
+from Supernote's plugin manager. Version 0.3.1 must be installed as a full
+`.snplg` update because its Chauvet 3.29.43 file permissions live in
+`PluginConfig.json`; hot-deploying only the JavaScript bundle cannot add them.
 
 ```sh
 adb push build/outputs/SupernoteFolderShortcuts.snplg /sdcard/MyStyle/

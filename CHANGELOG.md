@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Links to empty folders keep working.** The host answers `listFiles` with
+  `null`, not an empty list, for a directory with nothing in it, so a link to a
+  freshly made folder stopped working once its two-minute pending copy expired.
+  The folder picker also no longer reports an error inside an empty folder.
+  ([#12](../../issues/12))
+
 ## 0.3.1
 
 - **Restores the folder picker and link taps on Chauvet 3.29.43.** The firmware

@@ -169,9 +169,14 @@ function App(): React.JSX.Element {
       try {
         const files = (await FileUtils.listFiles(cwd)) as unknown as RawListItem[] | null | undefined;
         if (cancelled) {return;}
+        // The host resolves null, not [], for a directory with nothing in it.
+        if (files === null) {
+          setEntries([]);
+          return;
+        }
         if (!files) {
           setEntries([]);
-          setListError(`listFiles returned ${files === null ? 'null' : 'undefined'}`);
+          setListError('listFiles returned undefined');
           return;
         }
         setEntries(normalizeEntries(files));

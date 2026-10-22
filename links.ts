@@ -71,7 +71,11 @@ const isFolder = async (path: string): Promise<boolean> => {
   let result = false;
   try {
     const entries = await FileUtils.listFiles(path);
-    result = Array.isArray(entries);
+    // The host rejects a path that is missing or not a directory, and resolves
+    // null rather than [] for a directory that is empty. Treating null as "not
+    // a folder" left every link to a freshly made folder dead once its pending
+    // copy expired.
+    result = entries === null || Array.isArray(entries);
   } catch {
     result = false;
   }

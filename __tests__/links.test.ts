@@ -245,6 +245,16 @@ describe('readFolderLinks', () => {
     expect(await links.readFolderLinks(NOTE, 0)).toEqual([]);
   });
 
+  // The host resolves null rather than [] for an empty directory. Reading that
+  // as "not a folder" left every link to a freshly made folder dead once its
+  // pending copy expired; reproduced on a Manta.
+  it('keeps a link whose target is an empty directory', async () => {
+    mockListFiles.mockResolvedValue(null);
+    mockGetElements.mockResolvedValue(ok([linkElement()]));
+
+    expect(await links.readFolderLinks(NOTE, 0)).toHaveLength(1);
+  });
+
   it('ignores link types other than document', async () => {
     mockGetElements.mockResolvedValue(ok([linkElement({linkType: 0})]));
 

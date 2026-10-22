@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Taps outside the note no longer open its links.** After a link opened the
+  file manager, the host kept naming the note as the current file, even once
+  the note app had closed it, and the plugin's touch feed reports touches in
+  every app. A tap on a file manager breadcrumb or folder that landed where a
+  link sat on the note opened that link instead, which looked like a jump to
+  the wrong folder. A tap is now hit-tested only if the note app was already in
+  front when it went down, read from the foreground activity by the native
+  module. While the note is out of sight the page is no longer re-read every
+  heartbeat, and a closed note (error 118) drops its links.
+  ([#11](../../issues/11))
 - **Links to empty folders keep working.** The host answers `listFiles` with
   `null`, not an empty list, for a directory with nothing in it, so a link to a
   freshly made folder stopped working once its two-minute pending copy expired.

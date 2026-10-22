@@ -1,5 +1,6 @@
 package com.supernotefoldershortcuts;
 
+import android.app.ActivityManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -16,6 +17,8 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
+
+import java.util.List;
 
 /**
  * The native side of the plugin: a heartbeat that survives JS timer suspension,
@@ -160,6 +163,37 @@ public class FolderLinkModule extends ReactContextBaseJavaModule {
                 promise.resolve(false);
             }
         });
+    }
+
+    /**
+     * The activity on top of the foreground task, or null when it is unknown.
+     *
+     * The plugin's motion feed reads the touch device directly, so it reports
+     * touches made in the file manager and other apps too, and the SDK keeps
+     * naming the last note as the current file after the user has left it. This
+     * is what tells the two apart. getRunningTasks only lists other apps' tasks
+     * for privileged callers; the plugin host runs as android.uid.system.
+     */
+    @ReactMethod
+    @SuppressWarnings("deprecation")
+    public void getForegroundActivity(Promise promise) {
+        try {
+            ActivityManager manager = (ActivityManager)
+                    getReactApplicationContext().getSystemService(Context.ACTIVITY_SERVICE);
+            List<ActivityManager.RunningTaskInfo> tasks = manager.getRunningTasks(1);
+            ComponentName top = tasks == null || tasks.isEmpty() ? null : tasks.get(0).topActivity;
+            if (top == null) {
+                promise.resolve(null);
+                return;
+            }
+            WritableMap map = Arguments.createMap();
+            map.putString("packageName", top.getPackageName());
+            map.putString("className", top.getClassName());
+            promise.resolve(map);
+        } catch (Exception e) {
+            Log.e(TAG, "getForegroundActivity failed: " + e.getMessage(), e);
+            promise.resolve(null);
+        }
     }
 
     /** Used to convert a touch in screen pixels into page coordinates. */

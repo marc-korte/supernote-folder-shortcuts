@@ -19,6 +19,8 @@ import {
 import {
   createRefreshScheduler,
   contextPathKind,
+  foregroundAllowsTap,
+  foregroundKind,
   linkGeometryChanged,
   noteContextChanged,
   NOTE_HANDOFF_SETTLE_MS,
@@ -42,7 +44,7 @@ import {hasFileReadPermission} from './permissions';
 // running either an installed package or a hot-reloaded debug bundle, and the
 // two are indistinguishable in the log without this — which has repeatedly made
 // it unclear whether a fix was actually under test.
-const BUILD_ID = '0.3.1';
+const BUILD_ID = '0.3.2-dev';
 
 AppRegistry.registerComponent(appName, () => App);
 
@@ -176,6 +178,46 @@ const currentContext = async () => {
   return {notePath, page};
 };
 
+// ----- Whether the note is actually in front ------------------------------
+//
+// The motion feed reads the touch device directly, so it reports touches in
+// the file manager and every other app as well, and getCurrentFilePath keeps
+// naming the last note after the user has left it. Together they let a tap on
+// a file manager breadcrumb open whichever link sat at that spot on the note.
+// The heartbeat and the tap path both record which app is in front, and a tap
+// is only hit-tested if the note app was already in front when it went down.
+const FOREGROUND_REQUEST_TIMEOUT_MS = 1000;
+let foreground = 'unknown';
+let noteForegroundSince = 0;
+
+const recordForeground = (kind, top) => {
+  if (kind === 'note' && !noteForegroundSince) {noteForegroundSince = Date.now();}
+  if (kind === 'away') {noteForegroundSince = 0;}
+  if (kind !== foreground) {
+    foreground = kind;
+    console.log(
+      `[folder-link] foreground: ${kind}${top?.packageName ? ` (${top.packageName})` : ''}`,
+    );
+  }
+  return kind;
+};
+
+const probeForeground = async () => {
+  if (!Native || typeof Native.getForegroundActivity !== 'function') {
+    return recordForeground('unknown', null);
+  }
+  try {
+    const top = await withNativeTimeout(
+      Native.getForegroundActivity(),
+      FOREGROUND_REQUEST_TIMEOUT_MS,
+      'foreground activity',
+    );
+    return recordForeground(foregroundKind(top), top);
+  } catch {
+    return recordForeground('unknown', null);
+  }
+};
+
 // ----- Where a tap is tested against the note ------------------------------
 //
 // Taps used to be caught by invisible SYSTEM_ALERT_WINDOW rectangles laid over
@@ -240,6 +282,9 @@ let handoffObservedAt = 0;
 let handoffReadKey = '';
 const NO_CONTEXT_DISARM_MS = 60000;
 const EMPTY_TRANSITION_RETRIES = 1;
+// getElements: "The handwriting app is not open". The host still reports the
+// closed note as the current file.
+const ERR_NOTE_NOT_OPEN = 118;
 
 // Context observation and page scanning have deliberately separate lifetimes.
 // getElements can take several seconds on a large note; putting the next
@@ -478,6 +523,22 @@ const scanPage = (ctx, key, generation, cancelled) => {
         );
         return;
       }
+      if (e?.code === ERR_NOTE_NOT_OPEN) {
+        // The note app has closed this note. Its links describe a page that is
+        // no longer on screen, so drop them; coming back to the note is then an
+        // ordinary handoff that reads the page again.
+        if (generation === pageGeneration) {
+          invalidateCache();
+          measuredKey = '';
+          measuredAt = 0;
+          currentScale = null;
+          pageGeneration++;
+          pageScans.clear();
+          ensureMotionListener(false);
+          console.log(`[folder-link] note closed (code=118); dropped links for ${key}`);
+        }
+        return;
+      }
       if (!cancelled() && generation === pageGeneration) {
         measuredAt = 0;
       }
@@ -534,6 +595,12 @@ const runRefresh = async (ctx, {force, cancelled}) => {
       }
       return;
     }
+    // A note path with the note app out of sight means the file manager,
+    // another app, or the note app after it closed the note: the host keeps
+    // reporting the last file in all three. Keep the retained links for the
+    // return, but do not scan a page nobody is looking at; a closed note
+    // answers every heartbeat's getElements with code 118.
+    if ((await probeForeground()) === 'away' || cancelled()) {return;}
     const excursionPath = documentExcursionPath;
     const returningFromDocument = Boolean(excursionPath);
     if (returningFromDocument) {documentExcursionPath = '';}
@@ -889,6 +956,8 @@ const DRAG_SNAPSHOT_MAX_ATTEMPTS = 3;
 let lastDragRereadAt = 0;
 
 const noteMayHaveMoved = down => {
+  // A file manager scroll that starts where a link sat on the note moved nothing.
+  if (foreground === 'away') {return;}
   const ctx = activeNoteContext;
   const key = contextKey(ctx);
   if (!ctx || !key || !currentScale || measuredKey !== key) {return;}
@@ -1066,6 +1135,18 @@ const onMotion = async (e) => {
     if (recentlyOpened()) {return penLog('already opened for this tap');}
     ownsTap = claimTap();
     if (!ownsTap) {return penLog('PEN_UP owns this tap');}
+
+    const kind = await probeForeground();
+    const downAt = tapAt - (Number.isFinite(duration) && duration > 0 ? duration : 0);
+    if (!foregroundAllowsTap({kind, noteSince: noteForegroundSince, downAt})) {
+      releaseTap(ownsTap);
+      console.log(
+        `[folder-link] ${tool} tap ignored: note not in front (${
+          kind === 'note' ? 'just returned' : kind
+        })`,
+      );
+      return;
+    }
 
     const ctx = await currentContext();
     if (!ctx) {

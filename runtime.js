@@ -240,6 +240,47 @@ export const contextPathKind = path => {
   return /\.note$/i.test(path) ? 'note' : 'document';
 };
 
+/** The package whose activities can put a note page in front of the user. */
+export const NOTE_APP_PACKAGE = 'com.ratta.supernote.note';
+
+/** The plugin host, which owns this plugin's own picker and permission UI. */
+export const PLUGIN_HOST_PACKAGE = 'com.ratta.supernote.pluginhost';
+
+/**
+ * Classifies FolderLinkNative.getForegroundActivity() as 'note', 'away',
+ * 'plugin' for the host's own UI, or 'unknown' when the host could not say.
+ * The plugin's UI is opened from the note and already suppresses navigation
+ * while it is up, so it is left to that logic rather than treated as away.
+ *
+ * The current-file API cannot answer this. After a link opens the file manager
+ * it keeps naming the note, even once the note app has closed it (getElements
+ * then fails with code 118), so the note's link rectangles stayed armed and a
+ * tap on a file manager breadcrumb or folder opened a linked folder instead.
+ */
+export const foregroundKind = top => {
+  if (!top || typeof top.packageName !== 'string' || !top.packageName) {
+    return 'unknown';
+  }
+  if (top.packageName === NOTE_APP_PACKAGE) {return 'note';}
+  if (top.packageName === PLUGIN_HOST_PACKAGE) {return 'plugin';}
+  return 'away';
+};
+
+/**
+ * Whether a tap may be hit-tested against the note's links.
+ *
+ * The note must be in front now and must already have been in front when the
+ * touch went down. Checking only the moment of resolution lets the file manager
+ * tap that opens a note through: the note is on top a few milliseconds after
+ * that tap lifts, while the host still reports the previous note's links.
+ * An unknown foreground keeps the old behaviour instead of disabling every link
+ * on a host that cannot answer, and the plugin's own UI keeps its suppression.
+ */
+export const foregroundAllowsTap = ({kind, noteSince, downAt}) => {
+  if (kind === 'unknown' || kind === 'plugin') {return true;}
+  return kind === 'note' && noteSince > 0 && noteSince <= downAt;
+};
+
 /**
  * SDK 0.1.65 supplies the active pointer in `pointers`; older payloads placed
  * the same values at the top level. Accept both so a firmware-side rollout

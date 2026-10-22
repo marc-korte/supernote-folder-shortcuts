@@ -1,6 +1,8 @@
 import {
   createRefreshScheduler,
   contextPathKind,
+  foregroundAllowsTap,
+  foregroundKind,
   linkGeometryChanged,
   noteContextChanged,
   NOTE_HANDOFF_SETTLE_MS,
@@ -387,5 +389,44 @@ describe('sn-plugin-lib 0.1.65 compatibility', () => {
     expect(shouldRetryEmptyTransition(key, key, 0, 0)).toBe(false);
     expect(shouldRetryEmptyTransition(key, key, 2, 1)).toBe(false);
     expect(shouldRetryEmptyTransition('other.note#0', key, 0, 1)).toBe(false);
+  });
+});
+
+describe('foreground gate', () => {
+  const note = {packageName: 'com.ratta.supernote.note', className: 'x.NoteInsidePagesActivity'};
+  const fileManager = {
+    packageName: 'com.ratta.supernote.inbox',
+    className: 'com.ratta.supernote.explorer.FileManagerMainActivity',
+  };
+
+  test('classifies the activity in front', () => {
+    expect(foregroundKind(note)).toBe('note');
+    expect(foregroundKind(fileManager)).toBe('away');
+    expect(foregroundKind({packageName: 'com.ratta.supernote.pluginhost'})).toBe('plugin');
+    expect(foregroundKind(null)).toBe('unknown');
+    expect(foregroundKind({packageName: ''})).toBe('unknown');
+  });
+
+  // Reproduced on a Manta: with the file manager in front, a breadcrumb tap
+  // landed inside a link rectangle of the note the user had left and opened
+  // that folder instead.
+  test('refuses a tap while another app is in front', () => {
+    expect(foregroundAllowsTap({kind: 'away', noteSince: 0, downAt: 5000})).toBe(false);
+  });
+
+  // The file manager tap that opens a note lifts a few milliseconds before the
+  // note is on top, so the note being in front at resolution is not enough.
+  test('refuses a tap that went down before the note came to the front', () => {
+    expect(foregroundAllowsTap({kind: 'note', noteSince: 5010, downAt: 5000})).toBe(false);
+    expect(foregroundAllowsTap({kind: 'note', noteSince: 0, downAt: 5000})).toBe(false);
+  });
+
+  test('allows a tap on a note that was already in front', () => {
+    expect(foregroundAllowsTap({kind: 'note', noteSince: 1000, downAt: 5000})).toBe(true);
+  });
+
+  test('keeps the old behaviour when the host cannot say, and for plugin UI', () => {
+    expect(foregroundAllowsTap({kind: 'unknown', noteSince: 0, downAt: 5000})).toBe(true);
+    expect(foregroundAllowsTap({kind: 'plugin', noteSince: 0, downAt: 5000})).toBe(true);
   });
 });

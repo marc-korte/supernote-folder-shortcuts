@@ -132,6 +132,10 @@ npx tsc --noEmit
 
 GitHub Actions runs these checks on pushes and pull requests.
 
+Physical Nomad compatibility is still unverified. Use the
+[Nomad beta validation checklist](docs/NOMAD_VALIDATION.md) to test v0.3.2 and
+report device-specific results.
+
 On firmware that supports DEBUG hot-loading, JavaScript-only changes can use
 `deploy:bundle`. It pushes to the unsynced `/data/local/tmp` directory and requires
 the expected build stamp after a unique device log marker; it does not need to

@@ -1,10 +1,15 @@
 package com.supernotefoldershortcuts;
 
 import android.content.ComponentName;
+import android.app.ActivityManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.WindowManager;
@@ -16,6 +21,8 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
+
+import java.util.List;
 
 /**
  * The native side of the plugin: a heartbeat that survives JS timer suspension,
@@ -33,6 +40,20 @@ import com.facebook.react.modules.core.DeviceEventManagerModule;
 public class FolderLinkModule extends ReactContextBaseJavaModule {
     private static final String TAG = "[folder-link-native]";
     private static final String EVENT_TICK = "folderLinkTick";
+    private static final String OVERLAY_ACTION =
+            "com.ratta.supernote.launcher.slidebarstatusbarstate";
+    private boolean overlayVisible;
+    private long overlayGraceUntil;
+    private int interactionRevision;
+    private final BroadcastReceiver overlayReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!OVERLAY_ACTION.equals(intent.getAction())) return;
+            overlayVisible = intent.getBooleanExtra("show", false);
+            overlayGraceUntil = SystemClock.uptimeMillis() + 1500;
+            interactionRevision++;
+        }
+    };
 
     /**
      * How often JS is nudged to re-check which note and page is open.
@@ -68,6 +89,12 @@ public class FolderLinkModule extends ReactContextBaseJavaModule {
 
     public FolderLinkModule(ReactApplicationContext reactContext) {
         super(reactContext);
+        IntentFilter filter = new IntentFilter(OVERLAY_ACTION);
+        if (Build.VERSION.SDK_INT >= 33) {
+            reactContext.registerReceiver(overlayReceiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            reactContext.registerReceiver(overlayReceiver, filter);
+        }
         tickHandler.postDelayed(tick, TICK_MS);
     }
 
@@ -87,11 +114,57 @@ public class FolderLinkModule extends ReactContextBaseJavaModule {
     }
 
     @Override
-    public void invalidate() {
+    public synchronized void invalidate() {
         alive = false;
         tickHandler.removeCallbacks(tick);
+        getReactApplicationContext().unregisterReceiver(overlayReceiver);
         FingerMonitorReset.stop(getReactApplicationContext());
+        NoteUiGuard.shutdown();
         super.invalidate();
+    }
+
+    /** The SDK's last-file context does not identify the app receiving input. */
+    @ReactMethod
+    @SuppressWarnings("deprecation")
+    public void getForegroundActivity(Promise promise) {
+        try {
+            ActivityManager manager = (ActivityManager) getReactApplicationContext()
+                    .getSystemService(Context.ACTIVITY_SERVICE);
+            List<ActivityManager.RunningTaskInfo> tasks = manager.getRunningTasks(1);
+            ComponentName top = tasks.isEmpty() ? null : tasks.get(0).topActivity;
+            promise.resolve(top == null ? null : top.flattenToString());
+        } catch (Exception e) {
+            // Unknown foreground state must never arm a cached note rectangle.
+            promise.resolve(null);
+        }
+    }
+
+    @ReactMethod
+    public synchronized void setNoteInteractionActive(boolean active) {
+        if (!alive) return;
+        NoteUiGuard.setActive(active);
+    }
+
+    @ReactMethod
+    public void getInteractionState(double x, double y, Promise promise) {
+        NoteUiGuard.inspect((float) x, (float) y, snapshot -> tickHandler.post(() -> {
+            if (!alive) return;
+            WritableMap result = Arguments.createMap();
+            result.putBoolean("blocked", snapshot.blocked || overlayVisible ||
+                    SystemClock.uptimeMillis() < overlayGraceUntil);
+            result.putInt("revision", interactionRevision);
+            result.putInt("uiRevision", snapshot.revision);
+            promise.resolve(result);
+        }));
+    }
+
+    /** Allow the evdev reader to classify size even when SDK UP arrives first. */
+    @ReactMethod
+    public void validateFingerContact(double downTime, double eventTime, Promise promise) {
+        tickHandler.postDelayed(() -> {
+            if (alive) promise.resolve(!RawFingerTapMonitor.isRejectedContact(
+                    (long) downTime, (long) eventTime));
+        }, 50);
     }
 
     /**

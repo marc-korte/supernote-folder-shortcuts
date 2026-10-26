@@ -1,5 +1,6 @@
 import {
   createRefreshScheduler,
+  createFingerTapArbiter,
   contextPathKind,
   linkGeometryChanged,
   noteContextChanged,
@@ -18,6 +19,26 @@ import {
   tapAgeLimit,
   waitForStableNoteContext,
 } from './runtime';
+
+describe('raw/SDK contact ownership', () => {
+  const down = (x, eventTime) => ({action: 0, toolType: 1, x, y: 150, eventTime});
+  const up = (x, eventTime) => ({action: 1, toolType: 1, x, y: 150, eventTime});
+
+  test('does not swallow a distinct quick tap after a raw miss', () => {
+    const arbiter = createFingerTapArbiter();
+    expect(arbiter.raw({x: 120, y: 150, eventTime: 1050, durationMs: 50}, 1050)).toBe(true);
+    expect(arbiter.sdk(down(150, 1090), 1090)).toBe(true);
+    expect(arbiter.sdk(up(150, 1140), 1140)).toBe(true);
+    expect(arbiter.raw({x: 150, y: 150, eventTime: 1140, durationMs: 50}, 1140)).toBe(false);
+  });
+
+  test('does not mistake an earlier SDK gesture for the next raw fallback', () => {
+    const arbiter = createFingerTapArbiter();
+    expect(arbiter.sdk(down(150, 1000), 1000)).toBe(true);
+    expect(arbiter.sdk(up(150, 1050), 1050)).toBe(true);
+    expect(arbiter.raw({x: 150, y: 150, eventTime: 1140, durationMs: 50}, 1140)).toBe(true);
+  });
+});
 
 describe('refresh scheduling', () => {
   test('probes context again while an earlier page handler is still busy', async () => {

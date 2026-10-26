@@ -18,6 +18,8 @@ import {
 } from './links';
 import {
   createRefreshScheduler,
+  createFingerTapArbiter,
+  fingerContactIsPalm,
   contextPathKind,
   linkGeometryChanged,
   noteContextChanged,
@@ -42,7 +44,7 @@ import {hasFileReadPermission} from './permissions';
 // running either an installed package or a hot-reloaded debug bundle, and the
 // two are indistinguishable in the log without this — which has repeatedly made
 // it unclear whether a fix was actually under test.
-const BUILD_ID = '0.3.1';
+const BUILD_ID = '0.3.2-issues-10-19-r2';
 
 AppRegistry.registerComponent(appName, () => App);
 
@@ -54,6 +56,7 @@ const Native = NativeModules.FolderLinkNative;
 const CONTEXT_REQUEST_TIMEOUT_MS = 2000;
 let fingerFallbackReady = false;
 let fingerFallbackPromise = null;
+let fingerFallbackGeneration = 0;
 
 const ensureFingerFallback = (force = false) => {
   if (!force && fingerFallbackReady) {return Promise.resolve(true);}
@@ -61,9 +64,10 @@ const ensureFingerFallback = (force = false) => {
   if (!Native || typeof Native.resetFingerMonitor !== 'function') {
     return Promise.resolve(false);
   }
+  const generation = fingerFallbackGeneration;
   fingerFallbackPromise = Promise.resolve(Native.resetFingerMonitor())
     .then(ready => {
-      fingerFallbackReady = Boolean(ready);
+      fingerFallbackReady = generation === fingerFallbackGeneration && Boolean(ready);
       return fingerFallbackReady;
     })
     .catch(error => {
@@ -176,6 +180,34 @@ const currentContext = async () => {
   return {notePath, page};
 };
 
+// The host's current-file path survives leaving the note app. Foreground state
+// is checked independently, including at DOWN so a file-manager tap that opens
+// the note cannot be replayed against its newly visible link rectangles.
+const noteInFront = async () => {
+  try {
+    return await Native.getForegroundActivity() ===
+      'com.ratta.supernote.note/com.ratta.supernote.note.view.NoteInsidePagesActivity';
+  } catch {return false;}
+};
+
+const interactionState = async (x, y, rawUi) => {
+  try {
+    const [front, state, writable] = await Promise.all([
+      noteInFront(),
+      withNativeTimeout(Native.getInteractionState(x, y), 750, 'note UI state'),
+      withNativeTimeout(PluginCommAPI.canHandwrite(), 2000, 'handwriting state'),
+    ]);
+    return {allowed: front && !state.blocked && !rawUi?.blocked && unwrap(writable) === true,
+      revision: state.revision, uiRevision: rawUi?.revision ?? state.uiRevision};
+  } catch {return {allowed: false};}
+};
+
+const visibleContext = async () => {
+  if (await noteInFront()) {return currentContext();}
+  Native.setNoteInteractionActive?.(false);
+  return {away: true};
+};
+
 // ----- Where a tap is tested against the note ------------------------------
 //
 // Taps used to be caught by invisible SYSTEM_ALERT_WINDOW rectangles laid over
@@ -262,6 +294,8 @@ let fileReadAllowed = false;
 // Permission events and lifecycle callbacks can overlap; only the newest host
 // response may publish access state.
 let fileReadCheckGeneration = 0;
+let foregroundAway = false;
+let closedNoteKey = '';
 
 const EMPTY_TRANSITION_RETRY_MS = 500;
 
@@ -466,6 +500,17 @@ const scanPage = (ctx, key, generation, cancelled) => {
         `[folder-link] scan ${key} completed in ${measuredScanDurationMs}ms`,
       );
     } catch (e) {
+      if (Number(e?.code) === 118 && !cancelled() && generation === pageGeneration) {
+        closedNoteKey = key;
+        invalidateCache();
+        geometryDirtyKey = '';
+        dragDirtyKey = '';
+        penDown = null;
+        measuredAt = 0;
+        ensureMotionListener(false);
+        console.log('[folder-link] note closed (code=118); waiting for a note handoff');
+        return;
+      }
       if (e?.code === 1503) {
         fileReadCheckGeneration++;
         fileReadAllowed = false;
@@ -503,6 +548,27 @@ const scanPage = (ctx, key, generation, cancelled) => {
 const runRefresh = async (ctx, {force, cancelled}) => {
   if (cancelled()) {return;}
   if (!fileReadAllowed) {return;}
+  if (ctx?.away) {
+    if (!foregroundAway) {
+      foregroundAway = true;
+      contextEpoch++;
+      pageGeneration++;
+      pageScans.clear();
+      invalidatePageReads();
+      activeNoteContext = null;
+      penDown = null;
+      closedNoteKey = '';
+      // Any activity excursion can detach the SDK's underlying NOTE client,
+      // even when its current-file API keeps naming this same note.
+      documentExcursionPath = documentExcursionPath || 'foreground activity';
+      console.log('[folder-link] note not in front; page reads paused');
+    }
+    return;
+  }
+  if (foregroundAway) {
+    foregroundAway = false;
+    observedContextIdentity = '';
+  }
   if (!ctx) {
     if (!noContextSince) {
       noContextSince = Date.now();
@@ -539,6 +605,8 @@ const runRefresh = async (ctx, {force, cancelled}) => {
     if (returningFromDocument) {documentExcursionPath = '';}
     noContextSince = 0;
     const key = `${ctx.notePath}#${ctx.page}`;
+    if (closedNoteKey === key) {return;}
+    closedNoteKey = '';
     const retainedLinks = cachedLinksFor(ctx.notePath, ctx.page);
 
     // The JavaScript handle survives a NOTE/DOC client handoff, but its native
@@ -550,12 +618,12 @@ const runRefresh = async (ctx, {force, cancelled}) => {
     // leaves its raw-finger monitor stale after Document was active, so renew
     // that monitor before refreshing the existing listener ID.
     if (returningFromDocument) {
-      const reset = await ensureFingerFallback(true);
+      await ensureFingerFallback(true);
       if (
         cancelled() ||
         contextKey(activeNoteContext) !== key
       ) {return;}
-      if (!reset || !ensureMotionListener(true, true)) {
+      if (!ensureMotionListener(true, true)) {
         if (!documentExcursionPath) {documentExcursionPath = excursionPath;}
         console.log('[folder-link] document return: motion renewal pending');
         scheduleFollowup();
@@ -614,7 +682,7 @@ const runRefresh = async (ctx, {force, cancelled}) => {
 };
 
 refreshScheduler = createRefreshScheduler({
-  readContext: currentContext,
+  readContext: visibleContext,
   handleContext: runRefresh,
   onError: e => {
     console.log('[folder-link] context probe error:', e?.message ?? String(e));
@@ -690,7 +758,7 @@ const openFolder = async (folderPath) => {
  * new rectangle is trusted until the replacement snapshot lands.
  */
 const resolveLinkFast = async (ctx, x, y, pageScanPending = false) => {
-  if (!fileReadAllowed) {
+  if (!fileReadAllowed || closedNoteKey === contextKey(ctx)) {
     return {match: null, waitedForDirty: false, waitedForPageScan: false};
   }
   const key = contextKey(ctx);
@@ -852,6 +920,7 @@ const ACTION_UP = 1;
 const ACTION_CANCEL = 3;
 const TOOL_FINGER = 1;
 const TOOL_STYLUS = 2;
+const fingerArbiter = createFingerTapArbiter();
 const TAP_MAX_DURATION_MS = 300;
 const TAP_MAX_MOVEMENT_PX = 25;
 
@@ -980,6 +1049,7 @@ const preNavCheck = (expectedKey, expectedEpoch, expectedInput) => {
   if (
     !running ||
     !fileReadAllowed ||
+    closedNoteKey === expectedKey ||
     contextKey(activeNoteContext) !== expectedKey ||
     contextEpoch !== expectedEpoch ||
     (typeof expectedInput === 'number' && inputSeq !== expectedInput)
@@ -1001,18 +1071,25 @@ const scaleFor = async (ctx) =>
     ? currentScale
     : scaleProbe(ctx.notePath, ctx.page);
 
-const onMotion = async (e) => {
+const onMotion = async (e, raw = false) => {
   // Only ever release a claim this handler took: the catch below must not clear
   // the other path's claim on the way out.
   let ownsTap = 0;
   try {
     const motion = normalizeMotionEvent(e);
     if (motion.toolType !== TOOL_STYLUS && motion.toolType !== TOOL_FINGER) {return;}
+    if (!raw && !fingerArbiter.sdk(motion)) {return;}
     if (!fileReadAllowed) {
       penDown = null;
       return;
     }
     if (motion.pointerCount !== 1) {
+      inputSeq++;
+      penDown = null;
+      return;
+    }
+    if (motion.toolType === TOOL_FINGER && fingerContactIsPalm(motion)) {
+      inputSeq++;
       penDown = null;
       return;
     }
@@ -1026,12 +1103,14 @@ const onMotion = async (e) => {
         tool: motion.toolType,
         contextEpoch,
         input,
+        interaction: interactionState(motion.x, motion.y, e.rawUi),
       };
       return;
     }
     if (motion.action === ACTION_CANCEL) {
       // An aborted gesture has no up of its own. Left in place, its start point
       // waits to pair with the next orphan up and be measured as a tap.
+      inputSeq++;
       penDown = null;
       return;
     }
@@ -1056,7 +1135,8 @@ const onMotion = async (e) => {
     penLog(
       `${tool} up at ${motion.x},${motion.y} after ${duration}ms, moved ${Math.round(moved)}px`,
     );
-    if (duration > TAP_MAX_DURATION_MS || moved > TAP_MAX_MOVEMENT_PX) {
+    if (down.tool !== motion.toolType || duration < 0 ||
+      duration > TAP_MAX_DURATION_MS || moved > TAP_MAX_MOVEMENT_PX) {
       // Distance, not duration: a long press that stayed put moved nothing.
       if (moved > TAP_MAX_MOVEMENT_PX) {noteMayHaveMoved(down);}
       return penLog('not a tap');
@@ -1066,6 +1146,18 @@ const onMotion = async (e) => {
     if (recentlyOpened()) {return penLog('already opened for this tap');}
     ownsTap = claimTap();
     if (!ownsTap) {return penLog('PEN_UP owns this tap');}
+
+    const began = await down.interaction;
+    if (!began.allowed) {
+      releaseTap(ownsTap);
+      console.log('[folder-link] tap ignored: note or menu not ready at DOWN');
+      return;
+    }
+    if (motion.toolType === TOOL_FINGER &&
+      !await Native.validateFingerContact(down.t, motion.eventTime)) {
+      releaseTap(ownsTap);
+      return;
+    }
 
     const ctx = await currentContext();
     if (!ctx) {
@@ -1094,6 +1186,13 @@ const onMotion = async (e) => {
     if (!match) {
       releaseTap(ownsTap);
       console.log(`[folder-link] ${tool} tap at ${x},${y} matched no link`);
+      return;
+    }
+
+    const finalInteraction = await interactionState(motion.x, motion.y);
+    if (!finalInteraction.allowed || finalInteraction.revision !== began.revision ||
+      finalInteraction.uiRevision !== began.uiRevision) {
+      releaseTap(ownsTap);
       return;
     }
 
@@ -1150,10 +1249,20 @@ const onMotion = async (e) => {
 // multi-touch; feed its complete tap through the same ownership, context,
 // scale, and hit-testing path as an SDK gesture.
 DeviceEventEmitter.addListener('folderLinkRawFingerTap', event => {
+  if (event?.noteInFrontAtDown !== true || event?.uiBlockedAtDown !== false ||
+    !Number.isInteger(event?.uiRevisionAtDown)) {return;}
   const pair = rawFingerTapMotionPair(event);
   if (!pair) {return;}
-  onMotion(pair[0]);
-  onMotion(pair[1]);
+  if (!fingerArbiter.raw(event)) {return;}
+  onMotion({...pair[0], rawUi: {
+    blocked: event.uiBlockedAtDown, revision: event.uiRevisionAtDown,
+  }}, true);
+  onMotion(pair[1], true);
+});
+
+DeviceEventEmitter.addListener('folderLinkRawMonitorStopped', () => {
+  fingerFallbackGeneration++;
+  fingerFallbackReady = false;
 });
 
 /**
@@ -1162,6 +1271,7 @@ DeviceEventEmitter.addListener('folderLinkRawFingerTap', event => {
  * on an ordinary page costs nothing.
  */
 const ensureMotionListener = (wanted, renew = false) => {
+  Native.setNoteInteractionActive?.(wanted);
   // Start before the document excursion so the fallback retains absolute axes
   // the touchscreen may suppress when the next value is unchanged.
   if (wanted) {ensureFingerFallback();}
@@ -1238,11 +1348,18 @@ PluginManager.registerEventListener(EventType.PEN_UP, 0, {
       );
       const el = list.find((e) => e && extractTapPoint(e));
       if (!el) {return penLog('no element with a tap point, ignoring');}
+      const points = el.stroke?.points;
+      if (typeof points === 'number' && (points <= 0 || points > TAP_MAX_POINTS)) {return;}
       if (el.uuid && handledUuids.has(el.uuid)) {return penLog(`duplicate uuid ${el.uuid}`);}
       rememberHandled(el.uuid);
+      const tap = extractTapPoint(el);
+      // Capture the menu epoch before any context/stroke request can yield to
+      // the menu's dismiss action. The final point check uses the live scale.
+      const beganPromise = interactionState(
+        tap.x * (currentScale?.x ?? 1), tap.y * (currentScale?.y ?? 1),
+      );
 
       if (!(await isTapStroke(el))) {return penLog('stroke too long to be a tap');}
-      const tap = extractTapPoint(el);
 
       // Claimed only now: before isTapStroke this could still be handwriting,
       // and claiming every stroke would lock out real taps for a second.
@@ -1272,6 +1389,10 @@ PluginManager.registerEventListener(EventType.PEN_UP, 0, {
         return giveUp('context changed before tap resolution');
       }
 
+      const scale = await scaleFor(ctx);
+      const began = await beganPromise;
+      if (!began.allowed) {return giveUp('note menu blocked tap');}
+
       // A clean cached miss never reads the page. Only a linked drag marks the
       // snapshot dirty, and that path joins its already-running shared scan.
       const known = cachedLinksFor(ctx.notePath, ctx.page);
@@ -1299,6 +1420,11 @@ PluginManager.registerEventListener(EventType.PEN_UP, 0, {
         }
       }
 
+      const finalInteraction = await interactionState(tap.x * scale.x, tap.y * scale.y);
+      if (!finalInteraction.allowed || finalInteraction.revision !== began.revision ||
+        finalInteraction.uiRevision !== began.uiRevision) {
+        return giveUp('menu or foreground changed');
+      }
       const reason = preNavCheck(key, tapEpoch, tapInput);
       if (reason === 'context') {
         return giveUp('context moved on before opening; dot erased only');

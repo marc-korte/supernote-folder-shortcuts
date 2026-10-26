@@ -71,7 +71,9 @@ const isFolder = async (path: string): Promise<boolean> => {
   let result = false;
   try {
     const entries = await FileUtils.listFiles(path);
-    result = Array.isArray(entries);
+    // The host resolves null for an empty directory; files and missing paths
+    // reject instead. Undefined is still an invalid response.
+    result = entries === null || Array.isArray(entries);
   } catch {
     result = false;
   }
@@ -106,6 +108,16 @@ const sameSpot = (a: FolderLink, b: FolderLink): boolean =>
   a.page === b.page &&
   Math.abs(a.left - b.left) < 4 &&
   Math.abs(a.top - b.top) < 4;
+
+// getLassoRect and the persisted native link rectangle need not have the same
+// corners. Match the destination and positive overlap on this exact page so a
+// confirmed lasso box stops extending the stored link's tappable area.
+const confirmsPending = (stored: FolderLink, candidate: FolderLink): boolean =>
+  stored.notePath === candidate.notePath &&
+  stored.page === candidate.page &&
+  stored.folderPath === candidate.folderPath &&
+  Math.min(stored.right, candidate.right) > Math.max(stored.left, candidate.left) &&
+  Math.min(stored.bottom, candidate.bottom) > Math.max(stored.top, candidate.top);
 
 // ----- reading links off the page ------------------------------------------
 
@@ -232,9 +244,14 @@ const readFolderLinksOnce = async (
   // dropped; one this read still cannot see stays pending and is merged in so
   // it keeps working until the note is saved, but only until its deadline.
   const now = Date.now();
+  const confirmed = new Set<FolderLink>();
   pending = pending.filter(p => {
     if (p.notePath !== notePath || p.page !== page) {return true;}
-    if (links.some(l => sameSpot(l, p))) {return false;}
+    const stored = links.find(l => !confirmed.has(l) && confirmsPending(l, p));
+    if (stored) {
+      confirmed.add(stored);
+      return false;
+    }
     if (p.expiresAt <= now) {
       console.log(`[folder-link] pending link never persisted, dropping → ${p.folderPath}`);
       return false;
@@ -358,10 +375,33 @@ export const linkAt = (
   x: number,
   y: number,
   pad = 20,
-): FolderLink | undefined =>
-  links.find(
-    s => x >= s.left - pad && x <= s.right + pad && y >= s.top - pad && y <= s.bottom + pad,
-  );
+): FolderLink | undefined => {
+  let best: FolderLink | undefined;
+  let bestDistance = Infinity;
+  let bestCentre = Infinity;
+  let bestKey = '';
+  for (const link of links) {
+    if (!(x >= link.left - pad && x <= link.right + pad &&
+      y >= link.top - pad && y <= link.bottom + pad)) {continue;}
+    const dx = Math.max(link.left - x, 0, x - link.right);
+    const dy = Math.max(link.top - y, 0, y - link.bottom);
+    const distance = dx * dx + dy * dy;
+    const centre = (x - (link.left + link.right) / 2) ** 2 +
+      (y - (link.top + link.bottom) / 2) ** 2;
+    const key = [link.top, link.left, link.bottom, link.right, link.folderPath].join('|');
+    // A point inside the unpadded rectangle has distance zero. Where actual
+    // rectangles overlap, the nearest centre resolves the ambiguity; equal
+    // geometry uses a stable key so note element order cannot change the hit.
+    if (distance < bestDistance || (distance === bestDistance &&
+      (centre < bestCentre || (centre === bestCentre && key < bestKey)))) {
+      best = link;
+      bestDistance = distance;
+      bestCentre = centre;
+      bestKey = key;
+    }
+  }
+  return best;
+};
 
 /**
  * Uses only the cheap cached hit. An ordinary miss is not permission to scan

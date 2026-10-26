@@ -14,6 +14,8 @@ fi
 if [[ -z "${ANDROID_HOME:-}" ]]; then
     if [[ -d "$HOME/Library/Android/sdk" ]]; then
         export ANDROID_HOME="$HOME/Library/Android/sdk"
+    elif [[ -d "$HOME/Android/Sdk" ]]; then
+        export ANDROID_HOME="$HOME/Android/Sdk"
     fi
 fi
 
@@ -448,7 +450,7 @@ test_has_android_native_code() {
     local project_root="$1"
 
     for dir in "$project_root/android" "$project_root/app/android"; do
-        if [[ -d "$dir" ]] && find "$dir" -type f \( -name '*.java' -o -name '*.kt' \) -quit 2>/dev/null; then
+        if [[ -d "$dir" && -n "$(find "$dir" -type f \( -name '*.java' -o -name '*.kt' \) -print -quit 2>/dev/null)" ]]; then
             return 0
         fi
     done
@@ -460,7 +462,7 @@ test_has_android_native_code() {
             local name="${module#$node_modules_dir/}"
             is_ignored_module_name "$name" && continue
             for dir in "$module/android" "$module/platforms/android" "$module/platforms/android-native"; do
-                if [[ -d "$dir" ]] && find "$dir" -type f \( -name '*.java' -o -name '*.kt' \) -quit 2>/dev/null; then
+                if [[ -d "$dir" && -n "$(find "$dir" -type f \( -name '*.java' -o -name '*.kt' \) -print -quit 2>/dev/null)" ]]; then
                     return 0
                 fi
             done
@@ -469,7 +471,7 @@ test_has_android_native_code() {
 
     local javac_dir="$project_root/android/app/build/intermediates/javac"
     if [[ -d "$javac_dir" ]]; then
-        if find "$javac_dir" -type d -regex '.*/compile.*JavaWithJavac/classes' -exec find {} -type f -name '*.class' -quit \; 2>/dev/null; then
+        if [[ -n "$(find "$javac_dir" -type f -name '*.class' -print -quit 2>/dev/null)" ]]; then
             return 0
         fi
     fi
@@ -549,17 +551,15 @@ copy_apk_and_update_config() {
     local build_generated_dir="$2"
     local build_generated_config_file="$3"
 
-    local apk_search="$project_root/android/app/build/outputs/apk"
-    local apk_path=""
-    if [[ -d "$apk_search" ]]; then
-        apk_path="$(find "$apk_search" -type f -name '*custom*.apk' -print -quit 2>/dev/null || true)"
-        [[ -z "$apk_path" ]] && apk_path="$(find "$apk_search" -type f -name '*.apk' -print -quit 2>/dev/null || true)"
-    fi
-    [[ -z "$apk_path" ]] && { write_color_output "Generated APK not found" "Red"; return 1; }
+    # This is the output of buildCustomApkDebug, not an arbitrary APK from an
+    # earlier release build or an unprocessed APK with host-owned libraries.
+    local apk_path="$project_root/android/app/build/outputs/apk/debug/app-debug-custom.apk"
+    [[ -f "$apk_path" ]] || { write_color_output "Generated custom debug APK not found: $apk_path" "Red"; return 1; }
 
     local new_apk="app.npk"
     local target="$build_generated_dir/$new_apk"
-    cp "$apk_path" "$target" && write_color_output "APK copied to: $target" "Green"
+    cp "$apk_path" "$target"
+    write_color_output "APK copied to: $target" "Green"
 
     if command -v jq >/dev/null 2>&1; then
         jq --arg path "/$new_apk" '.nativeCodePackage = $path' "$build_generated_config_file" > "${build_generated_config_file}.tmp" && mv "${build_generated_config_file}.tmp" "$build_generated_config_file"
@@ -694,6 +694,13 @@ main() {
     local gen_dir
     gen_dir="$(ensure_build_generated_dir "$project_root")"
 
+    # A failed rebuild must never leave a previous native payload available to
+    # the packaging step, or an old installable package looking like its output.
+    rm -f "$gen_dir/app.npk" \
+        "$project_root/build/outputs/$PACKAGE_NAME.zip" \
+        "$project_root/build/outputs/$PACKAGE_NAME.snplg" \
+        "$project_root/android/app/build/outputs/apk/debug/app-debug-custom.apk"
+
     build_react_native_bundle "$project_root" "$PACKAGE_NAME" "$gen_dir"
 
     local root_cfg="$project_root/PluginConfig.json"
@@ -720,6 +727,8 @@ main() {
         should_build_native=0
     elif printf "%s\n" "$third_party_native_mods" | awk 'NF{found=1} END{exit(found?0:1)}'; then
         should_build_native=0
+    elif test_has_android_native_code "$project_root"; then
+        should_build_native=0
     fi
 
     if [[ "$should_build_native" -eq 0 ]]; then
@@ -730,11 +739,8 @@ main() {
         all_pkgs="$(printf "%s\n%s\n" "$project_react_pkgs" "$autolink_pkgs" | awk 'NF' | sort -u)"
         update_plugin_config_packages "$project_root" "$gen_dir" "$all_pkgs"
 
-        if build_android_apk "$project_root" "$gen_cfg"; then
-            copy_apk_and_update_config "$project_root" "$gen_dir" "$gen_cfg" || true
-        else
-            write_color_output "APK build failed" "Red"
-        fi
+        build_android_apk "$project_root" "$gen_cfg"
+        copy_apk_and_update_config "$project_root" "$gen_dir" "$gen_cfg"
     else
         write_color_output "Build conditions not met; skipping native build and reactPackages update" "Yellow"
     fi
@@ -742,9 +748,8 @@ main() {
     local outputs_dir
     outputs_dir="$(ensure_build_outputs_directory "$project_root")"
     local zip_path="$outputs_dir/${PACKAGE_NAME}.zip"
-    if new_zip_package "$gen_dir" "$zip_path"; then
-        rename_to_snplg_file "$zip_path" "$PACKAGE_NAME" >/dev/null
-    fi
+    new_zip_package "$gen_dir" "$zip_path"
+    rename_to_snplg_file "$zip_path" "$PACKAGE_NAME" >/dev/null
 
     write_color_output "Build process completed" "Blue"
 }

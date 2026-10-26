@@ -1,5 +1,7 @@
 package com.supernotefoldershortcuts;
 
+import android.app.ActivityManager;
+import android.content.ComponentName;
 import android.content.Context;
 import android.os.SystemClock;
 import android.system.ErrnoException;
@@ -15,41 +17,83 @@ import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 
+import java.io.BufferedReader;
 import java.io.FileDescriptor;
+import java.io.FileReader;
 import java.io.InterruptedIOException;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /** Reads only tap-sized finger gestures from the firmware's evdev stream. */
 final class RawFingerTapMonitor implements Runnable {
     static final String EVENT_TAP = "folderLinkRawFingerTap";
+    static final String EVENT_REJECTED = "folderLinkRawContactRejected";
+    static final String EVENT_STOPPED = "folderLinkRawMonitorStopped";
 
     private static final String TAG = "[folder-link-native]";
     private static final int INPUT_EVENT_BYTES = 24;
-    private static final int SLOT_COUNT = 32;
-    private static final int EV_SYN = 0;
-    private static final int EV_ABS = 3;
-    private static final int SYN_REPORT = 0;
-    private static final int ABS_MT_SLOT = 0x2f;
-    private static final int ABS_MT_POSITION_X = 0x35;
-    private static final int ABS_MT_POSITION_Y = 0x36;
-    private static final int ABS_MT_TRACKING_ID = 0x39;
-    private static final long TAP_MAX_DURATION_MS = 800;
-    private static final int TAP_MAX_MOVEMENT_RAW = 60;
     private static final byte[] WAKE_BYTE = {1};
 
-    private static RawFingerTapMonitor instance;
+    private static volatile RawFingerTapMonitor instance;
+    private static final RawFingerInput.MonitorHealth health = new RawFingerInput.MonitorHealth();
+    private static final RawFingerInput.Rejections rejectedContacts = new RawFingerInput.Rejections();
+
+    static boolean isRejectedContact(long downTime, long eventTime) {
+        return !health.allowsValidation()
+                || rejectedContacts.contains(downTime, eventTime, SystemClock.uptimeMillis());
+    }
 
     private volatile ReactApplicationContext reactContext;
     private final String devicePath;
-    private final int displayWidth;
-    private final int displayHeight;
-    private final boolean[] active = new boolean[SLOT_COUNT];
-    private final boolean[] eligible = new boolean[SLOT_COUNT];
-    private final boolean[] pendingUp = new boolean[SLOT_COUNT];
-    private final int[] rawX = new int[SLOT_COUNT];
-    private final int[] rawY = new int[SLOT_COUNT];
-    private final int[] startX = new int[SLOT_COUNT];
-    private final int[] startY = new int[SLOT_COUNT];
-    private final long[] downAt = new long[SLOT_COUNT];
+    private final WindowManager windowManager;
+    private final FileDescriptor device;
+    private final Map<Long, RawDownState> downStates = new LinkedHashMap<>();
+
+    private static final class RawDownState {
+        final boolean noteInFront;
+        boolean completed;
+        boolean blocked = true;
+        int revision = -1;
+        Runnable pending;
+
+        RawDownState(boolean inFront) { noteInFront = inFront; }
+
+        void complete(NoteUiGuard.Snapshot snapshot) {
+            Runnable publish;
+            synchronized (this) {
+                completed = true;
+                blocked = snapshot == null || snapshot.blocked;
+                revision = snapshot == null ? -1 : snapshot.revision;
+                publish = pending;
+                pending = null;
+            }
+            if (publish != null) publish.run();
+        }
+
+        void dispatch(Runnable publish) {
+            synchronized (this) {
+                if (!completed) { pending = publish; return; }
+            }
+            publish.run();
+        }
+    }
+    private final RawFingerInput input = new RawFingerInput(new RawFingerInput.TapSink() {
+        @Override
+        public void onTap(double x, double y, long downTime, long eventTime, int touchMajor) {
+            emitTap(x, y, downTime, eventTime, touchMajor);
+        }
+
+        @Override
+        public void onDown(double x, double y, long downTime) {
+            captureDown(x, y, downTime);
+        }
+
+        @Override
+        public void onRejected(long downTime, long eventTime, String reason) {
+            emitRejected(downTime, eventTime, reason);
+        }
+    });
 
     private volatile boolean running = true;
 
@@ -65,21 +109,51 @@ final class RawFingerTapMonitor implements Runnable {
     private FileDescriptor wakeWrite;
     private boolean wakeClosed;
 
-    private int slot;
-
-    private RawFingerTapMonitor(ReactApplicationContext context, String path) {
+    private RawFingerTapMonitor(ReactApplicationContext context, String path) throws Exception {
         reactContext = context;
         devicePath = path;
         DisplayMetrics metrics = new DisplayMetrics();
-        WindowManager windowManager =
+        windowManager =
                 (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
         windowManager.getDefaultDisplay().getRealMetrics(metrics);
-        displayWidth = metrics.widthPixels;
-        displayHeight = metrics.heightPixels;
-        initializeSlots();
+        String eventName = path.substring(path.lastIndexOf('/') + 1);
+        if (!eventName.matches("event[0-9]+")) {
+            throw new IllegalStateException("unsupported raw finger input path");
+        }
+        String panel;
+        try (BufferedReader reader = new BufferedReader(new FileReader(
+                "/sys/class/input/" + eventName + "/device/name"))) {
+            panel = reader.readLine();
+        }
+        boolean supported = RawFingerInput.supports(panel == null ? null : panel.trim(),
+                metrics.widthPixels, metrics.heightPixels,
+                windowManager.getDefaultDisplay().getRotation());
+        health.configure(supported);
+        if (!supported) {
+            throw new IllegalStateException("raw finger fallback is unverified for panel "
+                    + panel + " / " + metrics.widthPixels + "x" + metrics.heightPixels
+                    + " / rotation " + windowManager.getDefaultDisplay().getRotation());
+        }
+        FileDescriptor openedDevice = null;
+        FileDescriptor[] wake = null;
+        try {
+            // evdev open is nonblocking; no caller waits for an input record.
+            // Readiness is reported only after the descriptor and wake pipe
+            // exist, rather than optimistically before the worker opens them.
+            openedDevice = Os.open(devicePath,
+                    OsConstants.O_RDONLY | OsConstants.O_NONBLOCK | OsConstants.O_CLOEXEC, 0);
+            wake = Os.pipe();
+        } catch (Exception error) {
+            closeQuietly(openedDevice);
+            if (wake != null) { closeQuietly(wake[0]); closeQuietly(wake[1]); }
+            throw error;
+        }
+        device = openedDevice;
+        wakeRead = wake[0];
+        wakeWrite = wake[1];
     }
 
-    static synchronized void ensureStarted(ReactApplicationContext context, String path) {
+    static synchronized void ensureStarted(ReactApplicationContext context, String path) throws Exception {
         if (instance != null && instance.running && instance.devicePath.equals(path)) {
             instance.reactContext = context;
             return;
@@ -88,7 +162,17 @@ final class RawFingerTapMonitor implements Runnable {
         instance = new RawFingerTapMonitor(context, path);
         Thread thread = new Thread(instance, "folder-link-raw-finger");
         thread.setDaemon(true);
-        thread.start();
+        try {
+            health.opened();
+            thread.start();
+        } catch (Exception error) {
+            instance.running = false;
+            closeQuietly(instance.device);
+            closeQuietly(instance.wakeRead);
+            closeQuietly(instance.wakeWrite);
+            health.stopped();
+            throw error;
+        }
     }
 
     static synchronized void stopForContext(ReactApplicationContext context) {
@@ -100,6 +184,7 @@ final class RawFingerTapMonitor implements Runnable {
 
     private void stop() {
         running = false;
+        if (instance == this) health.stopped();
         // Not joined: the wake byte ends the poll immediately, and this runs on
         // the teardown path, where blocking the caller would be worse than
         // letting the last frame drain on its own thread.
@@ -115,18 +200,7 @@ final class RawFingerTapMonitor implements Runnable {
 
     @Override
     public void run() {
-        FileDescriptor device = null;
         try {
-            // Armed before the device is opened so a stop() racing startup
-            // always has something to write to. pipe2 is not in the public SDK,
-            // so these two carry no O_CLOEXEC; nothing here execs, and both ends
-            // are closed in the finally below.
-            FileDescriptor[] wake = Os.pipe();
-            synchronized (wakeLock) {
-                wakeRead = wake[0];
-                wakeWrite = wake[1];
-            }
-            device = Os.open(devicePath, OsConstants.O_RDONLY | OsConstants.O_CLOEXEC, 0);
             if (!running) return;
             Log.i(TAG, "raw finger fallback listening on " + devicePath);
             readLoop(device);
@@ -135,7 +209,12 @@ final class RawFingerTapMonitor implements Runnable {
                 Log.e(TAG, "raw finger fallback stopped: " + e.getMessage(), e);
             }
         } finally {
+            boolean unexpected = running;
             running = false;
+            if (instance == this) {
+                health.stopped();
+                if (unexpected) emitStopped();
+            }
             closeQuietly(device);
             synchronized (wakeLock) {
                 wakeClosed = true;
@@ -177,7 +256,7 @@ final class RawFingerTapMonitor implements Runnable {
             int type = unsignedShort(event, 16);
             int code = unsignedShort(event, 18);
             int value = signedInt(event, 20);
-            process(type, code, value);
+            input.process(type, code, value, SystemClock.uptimeMillis());
         }
     }
 
@@ -202,106 +281,52 @@ final class RawFingerTapMonitor implements Runnable {
         return false;
     }
 
-    private void process(int type, int code, int value) {
-        if (type == EV_ABS) {
-            if (code == ABS_MT_SLOT) {
-                if (value >= 0 && value < SLOT_COUNT) slot = value;
-                return;
-            }
-            if (code == ABS_MT_TRACKING_ID) {
-                if (value >= 0) begin(slot);
-                else pendingUp[slot] = true;
-                return;
-            }
-            if (code == ABS_MT_POSITION_X) {
-                rawX[slot] = value;
-                rejectMoved(slot);
-                return;
-            }
-            if (code == ABS_MT_POSITION_Y) {
-                rawY[slot] = value;
-                rejectMoved(slot);
-            }
-            return;
-        }
-        if (type == EV_SYN && code == SYN_REPORT) finishFrame();
+    @SuppressWarnings("deprecation")
+    private boolean noteInFront() {
+        try {
+            ActivityManager manager = (ActivityManager) reactContext
+                    .getSystemService(Context.ACTIVITY_SERVICE);
+            List<ActivityManager.RunningTaskInfo> tasks = manager.getRunningTasks(1);
+            ComponentName top = tasks.isEmpty() ? null : tasks.get(0).topActivity;
+            return top != null && "com.ratta.supernote.note".equals(top.getPackageName())
+                    && "com.ratta.supernote.note.view.NoteInsidePagesActivity".equals(top.getClassName());
+        } catch (Exception ignored) { return false; }
     }
 
-    private void begin(int targetSlot) {
-        boolean anotherFinger = activeCount() > 0;
-        if (anotherFinger) {
-            for (int index = 0; index < SLOT_COUNT; index++) {
-                if (active[index]) eligible[index] = false;
-            }
-        }
-        active[targetSlot] = true;
-        eligible[targetSlot] = !anotherFinger;
-        pendingUp[targetSlot] = false;
-        startX[targetSlot] = -1;
-        startY[targetSlot] = -1;
-        downAt[targetSlot] = SystemClock.uptimeMillis();
+    private void captureDown(double x, double y, long downTime) {
+        RawDownState state = new RawDownState(noteInFront());
+        downStates.put(downTime, state);
+        while (downStates.size() > 32) downStates.remove(downStates.keySet().iterator().next());
+        if (!state.noteInFront) { state.complete(null); return; }
+        try {
+            NoteUiGuard.inspect((float) x, (float) y, state::complete);
+        } catch (Exception ignored) { state.complete(null); }
     }
 
-    private void finishFrame() {
-        long now = SystemClock.uptimeMillis();
-        for (int index = 0; index < SLOT_COUNT; index++) {
-            if (active[index] && startX[index] < 0 && rawX[index] >= 0 && rawY[index] >= 0) {
-                startX[index] = rawX[index];
-                startY[index] = rawY[index];
-            }
-        }
-        for (int index = 0; index < SLOT_COUNT; index++) {
-            if (!pendingUp[index]) continue;
-            if (isTap(index, now)) {
-                emitTap(rawX[index], rawY[index], now - downAt[index]);
-            }
-            clearSlot(index);
-        }
+    private void emitTap(double screenX, double screenY, long downTime,
+            long eventTime, int touchMajor) {
+        RawDownState down = downStates.remove(downTime);
+        if (down == null) return;
+        down.dispatch(() -> publishTap(screenX, screenY, downTime, eventTime, touchMajor, down));
     }
 
-    private boolean isTap(int index, long now) {
-        return active[index]
-                && eligible[index]
-                && rawX[index] >= 0
-                && rawY[index] >= 0
-                && startX[index] >= 0
-                && startY[index] >= 0
-                && now - downAt[index] <= TAP_MAX_DURATION_MS
-                && movementSquared(index)
-                <= TAP_MAX_MOVEMENT_RAW * TAP_MAX_MOVEMENT_RAW;
-    }
-
-    private void rejectMoved(int index) {
-        if (active[index]
-                && startX[index] >= 0
-                && startY[index] >= 0
-                && movementSquared(index)
-                > TAP_MAX_MOVEMENT_RAW * TAP_MAX_MOVEMENT_RAW) {
-            eligible[index] = false;
-        }
-    }
-
-    private int movementSquared(int index) {
-        int dx = rawX[index] - startX[index];
-        int dy = rawY[index] - startY[index];
-        return dx * dx + dy * dy;
-    }
-
-    private int activeCount() {
-        int count = 0;
-        for (boolean value : active) if (value) count++;
-        return count;
-    }
-
-    private void emitTap(int touchX, int touchY, long durationMs) {
-        int rawMaxX = Math.max(displayWidth, displayHeight) - 1;
-        int rawMaxY = Math.min(displayWidth, displayHeight) - 1;
-        double screenX = touchX * (double) displayWidth / Math.max(1, rawMaxX);
-        double screenY = touchY * (double) displayHeight / Math.max(1, rawMaxY);
+    private void publishTap(double screenX, double screenY, long downTime,
+            long eventTime, int touchMajor, RawDownState down) {
+        if (!running || !down.noteInFront || down.blocked) return;
+        DisplayMetrics metrics = new DisplayMetrics();
+        windowManager.getDefaultDisplay().getRealMetrics(metrics);
+        if (!RawFingerInput.supports("pt_mt", metrics.widthPixels, metrics.heightPixels,
+                windowManager.getDefaultDisplay().getRotation())) return;
         WritableMap event = Arguments.createMap();
         event.putDouble("x", screenX);
         event.putDouble("y", screenY);
-        event.putDouble("durationMs", durationMs);
+        event.putDouble("durationMs", eventTime - downTime);
+        event.putDouble("downTime", downTime);
+        event.putDouble("eventTime", eventTime);
+        event.putInt("touchMajor", touchMajor);
+        event.putBoolean("noteInFrontAtDown", down.noteInFront);
+        event.putBoolean("uiBlockedAtDown", down.blocked);
+        event.putInt("uiRevisionAtDown", down.revision);
         try {
             reactContext
                     .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
@@ -311,24 +336,29 @@ final class RawFingerTapMonitor implements Runnable {
         }
     }
 
-    private void initializeSlots() {
-        for (int index = 0; index < SLOT_COUNT; index++) {
-            rawX[index] = -1;
-            rawY[index] = -1;
-            clearSlot(index);
+    private void emitRejected(long downTime, long eventTime, String reason) {
+        rejectedContacts.record(downTime, eventTime);
+        WritableMap event = Arguments.createMap();
+        event.putDouble("downTime", downTime);
+        event.putDouble("eventTime", eventTime);
+        event.putString("reason", reason);
+        try {
+            reactContext
+                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                    .emit(EVENT_REJECTED, event);
+        } catch (Exception e) {
+            Log.e(TAG, "raw contact rejection emit failed: " + e.getMessage(), e);
         }
     }
 
-    private void clearSlot(int index) {
-        active[index] = false;
-        eligible[index] = false;
-        pendingUp[index] = false;
-        // Keep the last absolute coordinates. The touchscreen suppresses an
-        // axis when its value did not change, so the next DOWN may need the
-        // coordinate from a previous frame to form a complete point.
-        startX[index] = -1;
-        startY[index] = -1;
-        downAt[index] = 0;
+    private void emitStopped() {
+        try {
+            WritableMap event = Arguments.createMap();
+            event.putBoolean("supported", true);
+            reactContext
+                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                    .emit(EVENT_STOPPED, event);
+        } catch (Exception ignored) { /* React may already be shutting down. */ }
     }
 
     private static void closeQuietly(FileDescriptor descriptor) {

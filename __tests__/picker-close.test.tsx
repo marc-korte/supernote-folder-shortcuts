@@ -8,14 +8,15 @@
  */
 
 import React from 'react';
-import {DeviceEventEmitter, Text} from 'react-native';
+import {DeviceEventEmitter, FlatList, Text} from 'react-native';
 import renderer, {act} from 'react-test-renderer';
 
 const mockClosePluginView = jest.fn();
 const mockSetLassoStrokeLink = jest.fn();
+const mockListFiles = jest.fn();
 
 jest.mock('sn-plugin-lib', () => ({
-  FileUtils: {listFiles: jest.fn(async () => [])},
+  FileUtils: {listFiles: (...a: any[]) => mockListFiles(...a)},
   PluginCommAPI: {
     getLassoRect: jest.fn(async () => ({result: {left: 1, top: 1, right: 9, bottom: 9}})),
     getCurrentPageNum: jest.fn(async () => ({result: 0})),
@@ -74,6 +75,7 @@ beforeEach(async () => {
   jest.clearAllMocks();
   mockSetLassoStrokeLink.mockResolvedValue({success: true});
   mockClosePluginView.mockResolvedValue(undefined);
+  mockListFiles.mockResolvedValue([]);
   await act(async () => {
     tree = renderer.create(<App />);
   });
@@ -172,4 +174,21 @@ test('unmount cancels a scheduled close instead of firing into a dead view', asy
   await flush();
 
   expect(mockClosePluginView).not.toHaveBeenCalled();
+});
+
+test('the picker shows the host null listing as an empty folder that can be linked', async () => {
+  mockListFiles.mockResolvedValue(null);
+  // A new visit reloads the directory after the native permission check.
+  act(() => tree.unmount());
+  await act(async () => {tree = renderer.create(<App />);});
+  await flush();
+
+  expect(tree.root.findAllByType(FlatList)).toHaveLength(1);
+  expect(tree.root.findByType(FlatList).props.data).toEqual([]);
+  expect(tree.root.findAllByType(Text).some((node: any) =>
+    String(node.props.children).includes('listFiles returned null'),
+  )).toBe(false);
+  expect(linkButton(tree).props.disabled).toBe(false);
+  await press(linkButton(tree));
+  expect(mockSetLassoStrokeLink).toHaveBeenCalledTimes(1);
 });

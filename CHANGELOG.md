@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.2
+
+- Fix empty-folder classification and confirm newly stored links by destination
+  and overlapping geometry, removing duplicate pending tap rectangles (#12, #18).
+- Rank overlapping link hits by containment and distance rather than note
+  element order (#17).
+- Require the note to receive the gesture, reject menu/overlay and dismissing
+  taps, and pause page reads outside the note or after error 118 (#11, #13).
+- Deduplicate SDK and raw reports before changing gesture ownership. Restrict
+  raw fallback to the verified Manta panel and reject palm-size/nonfinger
+  contacts across both input paths (#14–#16).
+- Abort packaging after a native build failure and discover Linux Android SDK
+  installs. Hot-deploy uses an unsynced temporary path and requires a fresh
+  matching load stamp; firmware that ignores reloads requires a full install
+  (#10, #19).
+- Add executable regression tests for link/picker behavior, actual runtime
+  callbacks, native input/UI policy, and build/deploy failure paths.
+- Validated on a physical Manta running Chauvet `2610191001` on 2026-10-26:
+  single finger navigation, normal file-manager navigation, persisted empty
+  folder links, palm rejection followed by a normal finger tap, and in-note
+  menu dismissal. All 139 automated tests, lint, TypeScript, and the full Android
+  package build pass.
+
 ## 0.3.1
 
 - **Restores the folder picker and link taps on Chauvet 3.29.43.** The firmware

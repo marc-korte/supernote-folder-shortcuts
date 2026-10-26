@@ -245,6 +245,34 @@ describe('readFolderLinks', () => {
     expect(await links.readFolderLinks(NOTE, 0)).toEqual([]);
   });
 
+  it('keeps an empty-directory link after its pending copy expires', async () => {
+    // The real host resolves null for an empty directory, and rejects a file
+    // or missing path. Mocking [] hid the two-minute failure on the device.
+    mockListFiles.mockResolvedValue(null);
+    mockGetElements.mockResolvedValue(ok([linkElement()]));
+    links.addPendingLink({
+      notePath: NOTE, page: 0, left: 886, top: 1190,
+      right: 1123, bottom: 1369, folderPath: FOLDER,
+    });
+    const clock = jest.spyOn(Date, 'now');
+    const now = Date.now();
+    try {
+      expect(await links.readFolderLinks(NOTE, 0)).toHaveLength(1);
+      clock.mockReturnValue(now + 121000);
+      const found = await links.readFolderLinks(NOTE, 0);
+      expect(found).toHaveLength(1);
+      expect(links.linkAt(found, 1000, 1250)?.folderPath).toBe(FOLDER);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('does not classify an undefined directory response as an empty folder', async () => {
+    mockListFiles.mockResolvedValue(undefined);
+    mockGetElements.mockResolvedValue(ok([linkElement()]));
+    expect(await links.readFolderLinks(NOTE, 0)).toEqual([]);
+  });
+
   it('ignores link types other than document', async () => {
     mockGetElements.mockResolvedValue(ok([linkElement({linkType: 0})]));
 
@@ -323,6 +351,62 @@ describe('pending links', () => {
     expect(await links.readFolderLinks(NOTE, 0)).toHaveLength(1);
   });
 
+  it('confirms a shifted stored rectangle and removes the extra lasso tap area', async () => {
+    const lasso = {...pending, left: 840, top: 1150, right: 1150, bottom: 1400};
+    links.addPendingLink(lasso);
+    mockGetElements.mockResolvedValue(ok([linkElement()]));
+
+    const found = await links.readFolderLinks(NOTE, 0);
+    expect(found).toEqual([pending]);
+    expect(links.linkAt(found, 845, 1155, 0)).toBeUndefined();
+
+    // Confirmation is permanent: removing the stored link does not resurrect
+    // its old pending rectangle before the two-minute TTL has elapsed.
+    mockGetElements.mockResolvedValue(ok([]));
+    expect(await links.readFolderLinks(NOTE, 0)).toEqual([]);
+  });
+
+  it('does not confirm a pending link using a different destination at the same spot', async () => {
+    links.addPendingLink(pending);
+    mockGetElements.mockResolvedValue(ok([linkElement({destPath: FOLDER + '/Other'})]));
+    expect(await links.readFolderLinks(NOTE, 0)).toHaveLength(2);
+  });
+
+  it('confirms only the overlapping link when two words share a destination', async () => {
+    const second = {...pending, left: 1200, right: 1400};
+    links.addPendingLink({...pending, left: 840, top: 1150});
+    links.addPendingLink(second);
+    mockGetElements.mockResolvedValue(ok([linkElement()]));
+    expect(await links.readFolderLinks(NOTE, 0)).toEqual([pending, second]);
+  });
+
+  it('does not use one stored link to confirm two overlapping pending words', async () => {
+    const second = {...pending, left: 1060, right: 1260};
+    links.addPendingLink(pending);
+    links.addPendingLink(second);
+    mockGetElements.mockResolvedValue(ok([linkElement()]));
+    expect(await links.readFolderLinks(NOTE, 0)).toEqual([pending, second]);
+  });
+
+  it('does not confirm a pending link from another note or page', async () => {
+    links.addPendingLink({...pending, page: 1});
+    links.addPendingLink({...pending, notePath: NOTE + '-other.note'});
+    mockGetElements.mockResolvedValueOnce(ok([linkElement()]));
+    await links.readFolderLinks(NOTE, 0);
+    mockGetElements.mockResolvedValue(ok([]));
+    expect(await links.readFolderLinks(NOTE, 1)).toEqual([{...pending, page: 1}]);
+    expect(await links.readFolderLinks(NOTE + '-other.note', 0)).toEqual([
+      {...pending, notePath: NOTE + '-other.note'},
+    ]);
+  });
+
+  it('does not confirm rectangles that only touch at an edge', async () => {
+    const adjacent = {...pending, left: 1123, right: 1200};
+    links.addPendingLink(adjacent);
+    mockGetElements.mockResolvedValue(ok([linkElement()]));
+    expect(await links.readFolderLinks(NOTE, 0)).toEqual([pending, adjacent]);
+  });
+
   it('does not serve a pending link for a different page', async () => {
     mockGetElements.mockResolvedValue(ok([]));
     links.addPendingLink(pending);
@@ -366,6 +450,31 @@ describe('linkAt', () => {
 
   it('does not match well outside the rect', () => {
     expect(links.linkAt([link], 400, 120)).toBeUndefined();
+  });
+
+  it('prefers an actual rectangle over an earlier padded match', () => {
+    const lower = {...link, top: 160, bottom: 210, folderPath: FOLDER + '/Child'};
+    expect(links.linkAt([link, lower], 150, 165)).toBe(lower);
+    expect(links.linkAt([lower, link], 150, 165)).toBe(lower);
+  });
+
+  it('chooses the nearest rectangle when padded boxes overlap', () => {
+    const lower = {...link, top: 180, bottom: 230, folderPath: FOLDER + '/Child'};
+    expect(links.linkAt([link, lower], 150, 169)).toBe(lower);
+    expect(links.linkAt([lower, link], 150, 169)).toBe(lower);
+  });
+
+  it('uses the nearest centre when the actual rectangles overlap', () => {
+    const lower = {...link, top: 130, bottom: 180, folderPath: FOLDER + '/Child'};
+    expect(links.linkAt([link, lower], 150, 145)).toBe(lower);
+    expect(links.linkAt([lower, link], 150, 145)).toBe(lower);
+  });
+
+  it('breaks equal-distance ties consistently regardless of storage order', () => {
+    const lower = {...link, top: 180, bottom: 230, folderPath: FOLDER + '/Child'};
+    expect(links.linkAt([link, lower], 150, 165)).toBe(
+      links.linkAt([lower, link], 150, 165),
+    );
   });
 
   it('does not turn an ordinary cached miss into a full page read', async () => {

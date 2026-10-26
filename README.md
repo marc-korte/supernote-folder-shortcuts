@@ -39,9 +39,14 @@ removed link disappears from the plugin's next note-page snapshot as well.
   stylus events. A press and release within 300 ms and 25 screen pixels is
   hit-tested against the cached native link rectangles. A single-finger raw
   input fallback covers the firmware's orphan first `UP` after a PDF/EPUB
-  handoff; it uses the same guarded hit-testing path. `PEN_UP` also provides the
+  handoff on the verified portrait Manta `pt_mt` panel. SDK and raw reports share
+  gesture ownership; large contacts and nonfinger tools are rejected. `PEN_UP` also provides the
   pen fallback and lets the plugin erase the small tap mark before opening the
   folder.
+- **Menus and foreground apps.** A tap must begin on the visible note, outside
+  its toolbar and menus. Native view inspection and launcher overlay broadcasts
+  suppress menus and their dismissing taps. Unknown UI states leave links
+  inactive until the paper is visible again.
 - **Moving linked objects.** A drag that begins on a linked rectangle marks its
   geometry dirty. The plugin waits for Supernote to commit the lasso move and
   rejects both incomplete snapshots and repeated pre-move rectangles before
@@ -49,7 +54,8 @@ removed link disappears from the plugin's next note-page snapshot as well.
 - **Navigation handoffs.** A native 500 ms heartbeat checks which note, page,
   PDF, or EPUB is active even while React Native timers are paused. The last
   good note links and listener remain available during a document excursion so
-  they are ready when **Last Opened Note** returns to the note.
+  they are ready when **Last Opened Note** returns to the note. Page reads pause
+  while another app is in front and stop after the note reports it is closed.
 - **Bounded native work.** Context requests have a two-second native deadline,
   page reads are single-flight, and stale reads cannot publish after a context
   change. Page elements and `PEN_UP` elements are recycled so the SDK's native
@@ -85,7 +91,7 @@ linked object continue to reach the note app normally.
 ### Prerequisites
 
 - Node.js 18 or newer
-- Java 21
+- A full JDK 17 or 21, including `javac` (set `JAVA_HOME` to that JDK)
 - Android SDK with build-tools installed
 
 ```sh
@@ -94,8 +100,11 @@ bash buildPlugin.sh
 ```
 
 On macOS, `buildPlugin.sh` selects Zulu 21 when the default Java is too new and
-uses `~/Library/Android/sdk` when `ANDROID_HOME` is unset. The package is written
-to `build/outputs/SupernoteFolderShortcuts.snplg`.
+uses `~/Library/Android/sdk` when `ANDROID_HOME` is unset. On Linux it also checks
+`~/Android/Sdk`. The package is written to
+`build/outputs/SupernoteFolderShortcuts.snplg`. A failed native build stops
+packaging and removes the previous installable output, so new JavaScript cannot
+be packaged with an old native payload.
 
 ## Install
 
@@ -111,7 +120,9 @@ adb push build/outputs/SupernoteFolderShortcuts.snplg /sdcard/MyStyle/
 ## Development and validation
 
 The automated suites cover the runtime scheduler and gesture decisions, note
-link reading/cache ownership, and picker lifecycle ownership:
+link reading/cache ownership, picker lifecycle ownership, native input and UI
+policies, and build/deploy failure handling. Native policy tests need `java`
+and `javac` on `PATH`:
 
 ```sh
 npm test -- --runInBand
@@ -119,15 +130,30 @@ npm run lint
 npx tsc --noEmit
 ```
 
-For JavaScript-only iteration on a connected development device, hot-deploy the
-bundle and require the fresh build stamp to appear in the device log:
+GitHub Actions runs these checks on pushes and pull requests.
+
+On firmware that supports DEBUG hot-loading, JavaScript-only changes can use
+`deploy:bundle`. It pushes to the unsynced `/data/local/tmp` directory and requires
+the expected build stamp after a unique device log marker; it does not need to
+clear the log buffers:
 
 ```sh
 npm run deploy:bundle
 ```
 
-Native changes require rebuilding and installing the `.snplg`. With a linked
-note page open, the device smoke check watches the live heartbeat, page reads,
+Chauvet builds `2609111001` and `2610191001` accept the DEBUG broadcast but ignore the reload.
+On that firmware, every change requires `bash buildPlugin.sh` and a full `.snplg`
+install through the plugin manager. A timeout from `deploy:bundle` reports this
+limitation; an accepted broadcast alone is never treated as success. Native
+changes and plugin permission changes always require a full `.snplg` install.
+Avoid putting development bundles in `/sdcard/MyStyle`, which is cloud-synced.
+
+Menu inspection uses Android's UI automation connection while note links are
+armed and releases it when leaving the note or stopping the plugin. Existing
+accessibility services remain enabled. Leave the note before running another
+`uiautomator` session.
+
+With a linked note page open, the device smoke check watches the live heartbeat, page reads,
 listener registration, error 206, and real finger/pen navigation logs:
 
 ```sh

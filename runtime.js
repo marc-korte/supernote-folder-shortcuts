@@ -265,16 +265,68 @@ export const normalizeMotionEvent = event => {
         : pointer?.toolType,
     x: typeof event?.x === 'number' ? event.x : pointer?.x,
     y: typeof event?.y === 'number' ? event.y : pointer?.y,
+    touchMajor: event?.touchMajor ?? pointer?.touchMajor,
+    size: event?.size ?? pointer?.size,
   };
 };
+
+/** Keep a duplicate raw/SDK report from becoming a new input epoch. */
+export const createFingerTapArbiter = () => {
+  let sdkDowns = [];
+  let rawTaps = [];
+  let duplicateSdk = false;
+  let activeSdk = null;
+  const near = (a, b) => Math.hypot(a.x - b.x, a.y - b.y) <= 35;
+  const overlaps = (down, raw) =>
+    down.eventTime <= raw.eventTime + 10 &&
+    (down.upTime === undefined || down.upTime >= raw.eventTime - raw.durationMs - 10) &&
+    Math.abs(down.eventTime - (raw.eventTime - raw.durationMs)) <= 100 && near(down, raw);
+  const prune = now => {
+    sdkDowns = sdkDowns.filter(item => now - item.receivedAt < 2000);
+    rawTaps = rawTaps.filter(item => now - item.receivedAt < 2000);
+  };
+  return {
+    sdk(motion, now = Date.now()) {
+      if (motion.toolType !== 1) {return true;}
+      prune(now);
+      if (motion.action === 0) {
+        duplicateSdk = rawTaps.some(raw => overlaps(motion, raw));
+        activeSdk = {...motion, receivedAt: now};
+        sdkDowns.push(activeSdk);
+      }
+      const accepted = !duplicateSdk;
+      if (motion.action === 1 || motion.action === 3) {
+        if (activeSdk) {activeSdk.upTime = motion.eventTime;}
+        activeSdk = null;
+        duplicateSdk = false;
+      }
+      return accepted;
+    },
+    raw(event, now = Date.now()) {
+      prune(now);
+      const raw = {...event, durationMs: event.durationMs ?? 1,
+        eventTime: event.eventTime ?? now, receivedAt: now};
+      if (sdkDowns.some(down => overlaps(down, raw))) {return false;}
+      if (rawTaps.some(previous =>
+        previous.eventTime === raw.eventTime && near(previous, raw))) {return false;}
+      rawTaps.push(raw);
+      return true;
+    },
+  };
+};
+
+/** Optional size fields vary by host version; keep unknown size eligible. */
+export const fingerContactIsPalm = motion =>
+  (Number.isFinite(motion.touchMajor) && motion.touchMajor > 255) ||
+  (Number.isFinite(motion.size) && motion.size > 1);
 
 /**
  * Adapts the native raw-touch fallback into the same complete gesture shape as
  * the SDK motion listener. The fallback has already rejected drags and
  * multi-touch, so its one tap needs only a coherent DOWN/UP boundary.
  */
-export const rawFingerTapMotionPair = (event, eventTime = Date.now()) => {
-  if (typeof event?.x !== 'number' || typeof event?.y !== 'number') {return null;}
+export const rawFingerTapMotionPair = (event, eventTime = event?.eventTime ?? Date.now()) => {
+  if (!Number.isFinite(event?.x) || !Number.isFinite(event?.y)) {return null;}
   const durationMs = Number.isFinite(event?.durationMs) && event.durationMs >= 0
     ? Math.min(event.durationMs, 60_000)
     : 1;

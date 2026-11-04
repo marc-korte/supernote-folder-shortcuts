@@ -1,7 +1,6 @@
 # Supernote Folder Shortcuts
 
-A plugin for the Supernote Manta that turns a lassoed handwritten, typed, or
-sticker object into a one-tap shortcut to a folder.
+A plugin for the Supernote Manta that turns a lassoed object into a one-tap shortcut to a folder.
 
 The Supernote note stores the link and draws its normal paperclip/underline
 marker. With the plugin enabled, tapping the linked object with either a finger
